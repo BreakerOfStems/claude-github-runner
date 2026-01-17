@@ -28,6 +28,7 @@ keywords = ["github", "automation", "claude", "ai"]
 
 dependencies = [
     "pyyaml>=6.0",
+    "textual>=0.47.0",
 ]
 
 [project.optional-dependencies]
@@ -41,6 +42,7 @@ dev = [
 
 [project.scripts]
 claude-github-runner = "claude_github_runner.cli:main"
+cgr = "claude_github_runner.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/anthropics/claude-github-runner"

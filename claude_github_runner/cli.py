@@ -294,7 +294,58 @@ def main():
         help="Show current status",
     )
 
+    # ui command
+    ui_parser = subparsers.add_parser(
+        "ui",
+        help="Launch the terminal UI",
+    )
+    ui_parser.add_argument(
+        "--db",
+        help="Path to runner.sqlite",
+    )
+    ui_parser.add_argument(
+        "--workspace-root",
+        help="Path to workspace root",
+    )
+    ui_parser.add_argument(
+        "--service-name",
+        default="claude-github-runner",
+        help="Systemd service name",
+    )
+    ui_parser.add_argument(
+        "--timer-name",
+        default="claude-github-runner.timer",
+        help="Systemd timer name",
+    )
+
     args = parser.parse_args()
+
+    # UI command doesn't need runner initialization
+    if args.command == "ui":
+        try:
+            from .ui import RunnerUI
+
+            # Get paths from config if available, then override with CLI args
+            config = Config.load(args.config)
+
+            db_path = args.db or config.paths.db_path
+            workspace_root = args.workspace_root or config.paths.workspace_root
+
+            app = RunnerUI(
+                db_path=db_path,
+                workspace_root=workspace_root,
+                service_name=args.service_name,
+                timer_name=args.timer_name,
+            )
+            app.run()
+        except ImportError as e:
+            print(f"Error: UI requires 'textual' package. Install with: pip install textual")
+            print(f"Details: {e}")
+            sys.exit(1)
+        except KeyboardInterrupt:
+            sys.exit(0)
+        return
+
     setup_logging(args.verbose)
 
     try:

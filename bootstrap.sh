@@ -53,8 +53,9 @@ echo "Installing claude-github-runner..."
 "$VENV_DIR/bin/pip" install --upgrade pip
 "$VENV_DIR/bin/pip" install --upgrade "$RUNNER_DIR"
 
-# create symlink in /usr/local/bin for easy access
+# create symlinks in /usr/local/bin for easy access
 ln -sf "$VENV_DIR/bin/claude-github-runner" /usr/local/bin/claude-github-runner
+ln -sf "$VENV_DIR/bin/cgr" /usr/local/bin/cgr
 
 # config directory
 mkdir -p "$CFG_DIR"
@@ -126,7 +127,9 @@ if [ "$FRESH_CONFIG" -eq 1 ]; then
   echo "NEXT STEPS:"
   echo "  1. Edit config to add your repos: sudo vim $CFG_FILE"
   echo "  2. Authenticate gh as claude user: sudo -u $CLAUDE_USER gh auth login"
-  echo "  3. Test: sudo -u $CLAUDE_USER claude-github-runner status"
+  echo "  3. Test: sudo -u $CLAUDE_USER cgr status"
+  echo "  4. Open UI: sudo -u $CLAUDE_USER cgr ui"
 else
   echo "Updated successfully. Config preserved."
+  echo "Open UI: sudo -u $CLAUDE_USER cgr ui"
 fi
