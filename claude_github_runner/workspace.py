@@ -231,3 +231,25 @@ class Git:
             args.append("--oneline")
         result = self._run(args)
         return result.stdout
+
+    def has_commits_ahead_of(self, base_ref: str) -> bool:
+        """Check if current branch has commits ahead of base_ref."""
+        # Fetch to make sure we have latest remote state
+        self._run(["fetch", "origin"], check=False)
+        # Count commits that are in HEAD but not in base_ref
+        result = self._run(["rev-list", "--count", f"{base_ref}..HEAD"], check=False)
+        try:
+            count = int(result.stdout.strip())
+            return count > 0
+        except (ValueError, AttributeError):
+            return False
+
+    def has_unpushed_commits(self) -> bool:
+        """Check if there are commits not pushed to origin."""
+        branch = self.get_current_branch()
+        result = self._run(["rev-list", "--count", f"origin/{branch}..HEAD"], check=False)
+        try:
+            count = int(result.stdout.strip())
+            return count > 0
+        except (ValueError, AttributeError):
+            return False

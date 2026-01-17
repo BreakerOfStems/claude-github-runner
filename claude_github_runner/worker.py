@@ -113,27 +113,47 @@ class Worker:
         logger.info("Invoking Claude Code")
         self._invoke_claude(paths, run_id)
 
-        # Check for changes
-        if not git.status():
+        # Check what Claude did - could be:
+        # 1. Made uncommitted changes (git status shows changes)
+        # 2. Already committed (check commits ahead of base)
+        # 3. Already committed AND pushed (check for PR)
+        # 4. Did nothing
+
+        has_uncommitted = bool(git.status())
+        has_new_commits = git.has_commits_ahead_of(f"origin/{self.config.branching.base_branch}")
+
+        # Check if Claude already created a PR
+        existing_pr = self.github.get_pr_for_branch(job.repo, branch_name)
+        if existing_pr:
+            logger.info(f"Claude already created PR: {existing_pr.url}")
+            self.db.update_run_status(run_id, RunStatus.SUCCEEDED, pr_url=existing_pr.url)
+            self._handle_success(job, run_id, paths, existing_pr.url)
+            self._write_summary(paths, run_id, job, "succeeded", pr_url=existing_pr.url)
+            self.workspace_manager.cleanup(run_id, success=True)
+            return
+
+        if not has_uncommitted and not has_new_commits:
             logger.info("No changes made by Claude")
             self._handle_no_changes(job, run_id, paths)
             return
 
-        # Save diff
-        git.add_all()
-        diff = git.diff(staged=True)
-        paths.git_diff.write_text(diff)
+        # If Claude made uncommitted changes, commit them
+        if has_uncommitted:
+            git.add_all()
+            diff = git.diff(staged=True)
+            paths.git_diff.write_text(diff)
 
-        # Commit
-        commit_message = self._build_commit_message(job)
-        if not git.commit(commit_message):
-            logger.info("Nothing to commit")
-            self._handle_no_changes(job, run_id, paths)
-            return
+            commit_message = self._build_commit_message(job)
+            if not git.commit(commit_message):
+                logger.info("Nothing to commit after staging")
+                if not has_new_commits:
+                    self._handle_no_changes(job, run_id, paths)
+                    return
 
-        # Push
-        logger.info(f"Pushing branch {branch_name}")
-        git.push("origin", branch_name, set_upstream=True)
+        # Push if there are unpushed commits
+        if git.has_unpushed_commits():
+            logger.info(f"Pushing branch {branch_name}")
+            git.push("origin", branch_name, set_upstream=True)
 
         # Create or update PR
         pr_url = self._create_or_update_pr(job, branch_name, paths)
