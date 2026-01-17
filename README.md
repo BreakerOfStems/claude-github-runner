@@ -38,11 +38,45 @@ gh api user -q .login
 
 ## Installation
 
-### From Source
+### Quick Start (VPS Bootstrap)
+
+On a fresh Linux VPS, run as root:
+
+```bash
+# Create the claude user first (if it doesn't exist)
+useradd -m -s /bin/bash claude
+
+# Download and run the bootstrap script
+curl -fsSL https://raw.githubusercontent.com/BreakerOfStems/claude-github-runner/main/bootstrap.sh -o bootstrap.sh
+sudo bash bootstrap.sh
+```
+
+The bootstrap script will:
+- Install Python and dependencies
+- Clone the repo to `/opt/claude-github-runner`
+- Install the CLI to `/usr/local/bin`
+- Create config at `/etc/claude-github-runner/config.yml`
+- Set up workspace at `/home/claude/workspace`
+- Enable systemd timers
+
+After bootstrap, configure your repos and authenticate:
+
+```bash
+# Edit config to add your repositories
+sudo vim /etc/claude-github-runner/config.yml
+
+# Authenticate gh CLI as the claude user
+sudo -u claude gh auth login
+
+# Verify
+sudo -u claude claude-github-runner status
+```
+
+### Manual Installation
 
 ```bash
 # Clone the repository
-git clone https://github.com/anthropics/claude-github-runner.git
+git clone https://github.com/BreakerOfStems/claude-github-runner.git
 cd claude-github-runner
 
 # Install with pip
