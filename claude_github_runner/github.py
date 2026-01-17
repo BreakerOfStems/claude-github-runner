@@ -128,28 +128,33 @@ class GitHub:
         since: Optional[datetime] = None,
     ) -> list[int]:
         """Search for issues/PRs that mention the user since last poll."""
-        # Build search query - use --repo flag instead of embedding in query
-        # to avoid shell quoting issues
-        query = f"mentions:{login}"
+        # Use gh api to search directly - avoids CLI quoting issues
+        # GitHub search API: https://docs.github.com/en/rest/search#search-issues-and-pull-requests
+        query_parts = [f"repo:{repo}", f"mentions:{login}"]
         if since:
-            # GitHub search uses YYYY-MM-DDTHH:MM:SS format
-            query += f" updated:>{since.strftime('%Y-%m-%dT%H:%M:%S')}"
+            query_parts.append(f"updated:>{since.strftime('%Y-%m-%dT%H:%M:%S')}")
+
+        query = " ".join(query_parts)
 
         result = self._run_gh([
-            "search", "issues",
-            "--repo", repo,
-            "--json", "number",
-            "--limit", "100",
-            "--", query
-        ])
+            "api", "search/issues",
+            "-X", "GET",
+            "-f", f"q={query}",
+            "-f", "per_page=100",
+            "--jq", ".items[].number",
+        ], check=False)
+
+        if result.returncode != 0:
+            logger.warning(f"Mention search failed: {result.stderr}")
+            return []
 
         if not result.stdout.strip():
             return []
 
         try:
-            data = json.loads(result.stdout)
-            return [item["number"] for item in data]
-        except json.JSONDecodeError:
+            # Output is one number per line from jq
+            return [int(n) for n in result.stdout.strip().split("\n") if n]
+        except ValueError:
             logger.error(f"Failed to parse mention search results: {result.stdout}")
             return []
 

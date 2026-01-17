@@ -53,12 +53,19 @@ class Discovery:
             logger.info(f"Discovering jobs in {repo}")
 
             # Get mention jobs first (higher priority)
-            mention_jobs = self._discover_mention_jobs(repo)
-            jobs.extend(mention_jobs)
+            # Wrap in try/except so mention search failures don't block ready issues
+            try:
+                mention_jobs = self._discover_mention_jobs(repo)
+                jobs.extend(mention_jobs)
+            except Exception as e:
+                logger.warning(f"Mention discovery failed for {repo}: {e}")
 
             # Get ready issue jobs
-            issue_jobs = self._discover_ready_issues(repo)
-            jobs.extend(issue_jobs)
+            try:
+                issue_jobs = self._discover_ready_issues(repo)
+                jobs.extend(issue_jobs)
+            except Exception as e:
+                logger.warning(f"Ready issue discovery failed for {repo}: {e}")
 
         # Sort by priority
         if self.config.priorities.mention_first:
