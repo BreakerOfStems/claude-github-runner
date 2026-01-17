@@ -242,13 +242,11 @@ class Worker:
     def _invoke_claude(self, paths: WorkspacePaths, run_id: str):
         """Invoke Claude Code non-interactively."""
         # Build command for headless execution:
-        # --yes: auto-accept all prompts
-        # --dangerously-skip-permissions: skip tool permission checks
+        # --dangerously-skip-permissions: skip tool permission checks (from config)
         # -p: provide the prompt
         prompt = paths.prompt_file.read_text()
         cmd = [
             self.config.claude.command,
-            "--yes",  # Auto-accept prompts, don't wait for confirmation
             *self.config.claude.non_interactive_args,
             "-p", prompt,
         ]
