@@ -1,0 +1,17 @@
+[Unit]
+Description=Claude GitHub Runner - scheduled tick
+Documentation=https://github.com/anthropics/claude-github-runner
+
+[Timer]
+# Run every 5 minutes
+OnBootSec=1min
+OnUnitActiveSec=5min
+
+# Randomize slightly to avoid thundering herd
+RandomizedDelaySec=30
+
+# Persist timer across reboots
+Persistent=true
+
+[Install]
+WantedBy=timers.target

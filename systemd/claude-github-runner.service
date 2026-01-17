@@ -1,0 +1,33 @@
+[Unit]
+Description=Claude GitHub Runner - tick cycle
+Documentation=https://github.com/anthropics/claude-github-runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=claude
+Group=claude
+WorkingDirectory=/home/claude
+
+# Main execution
+ExecStart=/usr/local/bin/claude-github-runner tick
+
+# Environment
+Environment="HOME=/home/claude"
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-github-runner
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/claude/workspace
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
