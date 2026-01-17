@@ -84,19 +84,23 @@ class GitHub:
         oldest_first: bool = True,
     ) -> list[Issue]:
         """Search for ready issues in a repository."""
-        # Build search query - use --repo flag to avoid quoting issues
-        blocked_parts = " ".join(f"-label:{label}" for label in blocked_labels)
-        query = f"is:issue is:open label:{ready_label} no:assignee -label:{in_progress_label} {blocked_parts}"
-
-        result = self._run_gh([
+        # Use gh search with flags instead of query string (more reliable)
+        args = [
             "search", "issues",
             "--repo", repo,
+            "--state", "open",
+            "--label", ready_label,
             "--json", "number,title,body,labels,assignees,createdAt,url",
             "--sort", "created",
             "--order", "asc" if oldest_first else "desc",
             "--limit", "100",
-            "--", query
-        ])
+        ]
+
+        result = self._run_gh(args, check=False)
+
+        if result.returncode != 0:
+            logger.warning(f"Issue search failed: {result.stderr}")
+            return []
 
         if not result.stdout.strip():
             return []
@@ -107,14 +111,33 @@ class GitHub:
             logger.error(f"Failed to parse search results: {result.stdout}")
             return []
 
+        # Filter results in Python since gh search doesn't support all filters as flags
+        # - must not have in_progress label
+        # - must not have any blocked labels
+        # - must not have assignees
         issues = []
         for item in data:
+            labels = [l["name"] for l in item.get("labels", [])]
+            assignees = [a["login"] for a in item.get("assignees", [])]
+
+            # Skip if has in-progress label
+            if in_progress_label in labels:
+                continue
+
+            # Skip if has any blocked label
+            if any(bl in labels for bl in blocked_labels):
+                continue
+
+            # Skip if has assignees
+            if assignees:
+                continue
+
             issues.append(Issue(
                 number=item["number"],
                 title=item["title"],
                 body=item.get("body") or "",
-                labels=[l["name"] for l in item.get("labels", [])],
-                assignees=[a["login"] for a in item.get("assignees", [])],
+                labels=labels,
+                assignees=assignees,
                 created_at=datetime.fromisoformat(item["createdAt"].replace("Z", "+00:00")),
                 url=item["url"],
             ))
