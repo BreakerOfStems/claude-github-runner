@@ -18,12 +18,16 @@ class JournalLogStream:
         """Start streaming logs."""
         self._running = True
 
+        # Use compact output format: just timestamp and message
+        # -o short-iso gives "YYYY-MM-DDTHH:MM:SS+TZ hostname service[pid]: message"
+        # We'll parse and reformat for even more compact output
         self._process = await asyncio.create_subprocess_exec(
             "journalctl",
             "-u", self.service_name,
             "-n", str(self.lines),
             "-f",
             "--no-pager",
+            "-o", "short-iso",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
@@ -36,11 +40,39 @@ class JournalLogStream:
                         timeout=0.5
                     )
                     if line:
-                        yield line.decode().rstrip()
+                        yield self._format_line(line.decode().rstrip())
                     elif self._process.returncode is not None:
                         break
                 except asyncio.TimeoutError:
                     continue
+
+    def _format_line(self, line: str) -> str:
+        """Reformat journald line to be more compact.
+
+        Input:  2026-01-17T04:12:13+0000 hostname service[pid]: actual message
+        Output: 04:12:13 actual message
+        """
+        # Skip empty lines
+        if not line.strip():
+            return ""
+
+        # Try to parse the ISO timestamp format
+        # Format: YYYY-MM-DDTHH:MM:SS+ZZZZ hostname service[pid]: message
+        parts = line.split(" ", 3)  # Split into max 4 parts
+
+        if len(parts) >= 4:
+            timestamp = parts[0]  # 2026-01-17T04:12:13+0000
+            # hostname = parts[1]  # skip
+            # service = parts[2]   # skip (e.g., claude-github-runner[12345]:)
+            message = parts[3]    # the actual log message
+
+            # Extract just HH:MM:SS from timestamp
+            if "T" in timestamp:
+                time_part = timestamp.split("T")[1][:8]  # Get HH:MM:SS
+                return f"{time_part} {message}"
+
+        # Fallback: return original line if parsing fails
+        return line
 
     async def stop(self):
         """Stop streaming."""
