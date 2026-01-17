@@ -206,13 +206,17 @@ class Worker:
             ])
 
         lines.extend([
-            "## Rules",
+            "## Important: Unattended Execution",
             "",
-            "1. Do not push directly to main/master branch",
-            "2. Keep changes minimal and focused on the task",
-            "3. Run any existing tests/checks if present",
-            "4. Follow the existing code style and conventions",
-            "5. Include appropriate comments for complex logic",
+            "You are running in unattended/headless mode. Follow these rules strictly:",
+            "",
+            "1. **Do NOT ask questions** - make reasonable decisions based on context",
+            "2. **Do NOT wait for approval** - proceed with implementation",
+            "3. **If genuinely blocked** (missing critical info, ambiguous requirements that could go very wrong), stop and write a clear explanation of what you need to proceed. Do not make changes if you cannot determine the correct approach.",
+            "4. **Do NOT push to main/master** - work on the feature branch only",
+            "5. Keep changes minimal and focused on the task",
+            "6. Run any existing tests/checks if present",
+            "7. Follow the existing code style and conventions",
             "",
         ])
 
@@ -220,16 +224,20 @@ class Worker:
 
     def _invoke_claude(self, paths: WorkspacePaths, run_id: str):
         """Invoke Claude Code non-interactively."""
-        # Use -p (prompt) flag for agentic execution
-        # --print is non-agentic and won't make file changes
+        # Build command for headless execution:
+        # --yes: auto-accept all prompts
+        # --dangerously-skip-permissions: skip tool permission checks
+        # -p: provide the prompt
         prompt = paths.prompt_file.read_text()
         cmd = [
             self.config.claude.command,
+            "--yes",  # Auto-accept prompts, don't wait for confirmation
             *self.config.claude.non_interactive_args,
             "-p", prompt,
         ]
 
-        logger.debug(f"Running Claude in: {paths.repo}")
+        logger.info(f"Running Claude in: {paths.repo}")
+        logger.debug(f"Command: {' '.join(cmd[:3])}...")
 
         with open(paths.claude_log, "w") as log_file:
             result = subprocess.run(
