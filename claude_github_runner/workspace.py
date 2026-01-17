@@ -244,10 +244,25 @@ class Git:
         except (ValueError, AttributeError):
             return False
 
-    def has_unpushed_commits(self) -> bool:
-        """Check if there are commits not pushed to origin."""
+    def has_unpushed_commits(self, base_branch: str = "main") -> bool:
+        """Check if there are commits not pushed to origin.
+
+        If the current branch doesn't exist on remote, checks against base_branch instead.
+        """
         branch = self.get_current_branch()
+
+        # First try comparing to the remote tracking branch
         result = self._run(["rev-list", "--count", f"origin/{branch}..HEAD"], check=False)
+        if result.returncode == 0:
+            try:
+                count = int(result.stdout.strip())
+                return count > 0
+            except (ValueError, AttributeError):
+                pass
+
+        # Remote branch doesn't exist - compare to base branch
+        # If we have commits ahead of origin/base_branch, we need to push
+        result = self._run(["rev-list", "--count", f"origin/{base_branch}..HEAD"], check=False)
         try:
             count = int(result.stdout.strip())
             return count > 0

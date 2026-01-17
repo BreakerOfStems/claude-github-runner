@@ -151,7 +151,7 @@ class Worker:
                     return
 
         # Push if there are unpushed commits
-        if git.has_unpushed_commits():
+        if git.has_unpushed_commits(self.config.branching.base_branch):
             logger.info(f"Pushing branch {branch_name}")
             git.push("origin", branch_name, set_upstream=True)
 
