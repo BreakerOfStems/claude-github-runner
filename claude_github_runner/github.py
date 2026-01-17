@@ -84,14 +84,13 @@ class GitHub:
         oldest_first: bool = True,
     ) -> list[Issue]:
         """Search for ready issues in a repository."""
-        # Build search query
+        # Build search query - use --repo flag to avoid quoting issues
         blocked_parts = " ".join(f"-label:{label}" for label in blocked_labels)
-        query = f"repo:{repo} is:issue is:open label:{ready_label} no:assignee -label:{in_progress_label} {blocked_parts}"
-
-        sort_order = "created-asc" if oldest_first else "created-desc"
+        query = f"is:issue is:open label:{ready_label} no:assignee -label:{in_progress_label} {blocked_parts}"
 
         result = self._run_gh([
             "search", "issues",
+            "--repo", repo,
             "--json", "number,title,body,labels,assignees,createdAt,url",
             "--sort", "created",
             "--order", "asc" if oldest_first else "desc",
@@ -129,14 +128,16 @@ class GitHub:
         since: Optional[datetime] = None,
     ) -> list[int]:
         """Search for issues/PRs that mention the user since last poll."""
-        # Build search query
-        query = f"repo:{repo} mentions:{login}"
+        # Build search query - use --repo flag instead of embedding in query
+        # to avoid shell quoting issues
+        query = f"mentions:{login}"
         if since:
-            # GitHub search uses YYYY-MM-DD format
+            # GitHub search uses YYYY-MM-DDTHH:MM:SS format
             query += f" updated:>{since.strftime('%Y-%m-%dT%H:%M:%S')}"
 
         result = self._run_gh([
             "search", "issues",
+            "--repo", repo,
             "--json", "number",
             "--limit", "100",
             "--", query
