@@ -248,6 +248,10 @@ class Worker:
 
         if result.returncode != 0:
             logger.warning(f"Claude exited with code {result.returncode}")
+            # Log stderr for debugging
+            if result.stderr:
+                for line in result.stderr.strip().split('\n')[:10]:
+                    logger.warning(f"Claude stderr: {line}")
             # Don't raise - Claude might have made partial progress
 
     def _build_commit_message(self, job: Job) -> str:
@@ -382,7 +386,8 @@ class Worker:
             logger.warning(f"Failed to update GitHub on no-changes: {e}")
 
         self._write_summary(paths, run_id, job, "no_changes")
-        self.workspace_manager.cleanup(run_id, success=True)
+        # Keep workspace for debugging (treat as failure for cleanup purposes)
+        self.workspace_manager.cleanup(run_id, success=False)
 
     def _handle_merge_conflict(self, job: Job, run_id: str, paths: WorkspacePaths, git: Git):
         """Handle merge conflicts."""
