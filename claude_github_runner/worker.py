@@ -151,7 +151,8 @@ class Worker:
     def _claim_on_github(self, job: Job, run_id: str):
         """Claim the issue/PR on GitHub and post starting comment."""
         try:
-            # Add in-progress label
+            # Remove ready label and add in-progress
+            self.github.remove_label(job.repo, job.target_number, self.config.labels.ready)
             self.github.add_label(job.repo, job.target_number, self.config.labels.in_progress)
 
             # Assign to self
@@ -219,22 +220,20 @@ class Worker:
 
     def _invoke_claude(self, paths: WorkspacePaths, run_id: str):
         """Invoke Claude Code non-interactively."""
+        # Use -p (prompt) flag for agentic execution
+        # --print is non-agentic and won't make file changes
+        prompt = paths.prompt_file.read_text()
         cmd = [
             self.config.claude.command,
-            "--print",
             *self.config.claude.non_interactive_args,
-            "--output-format", "text",
+            "-p", prompt,
         ]
 
-        # Read prompt from file
-        prompt = paths.prompt_file.read_text()
-
-        logger.debug(f"Running Claude: {' '.join(cmd)}")
+        logger.debug(f"Running Claude in: {paths.repo}")
 
         with open(paths.claude_log, "w") as log_file:
             result = subprocess.run(
                 cmd,
-                input=prompt,
                 capture_output=True,
                 text=True,
                 cwd=paths.repo,
@@ -341,8 +340,13 @@ class Worker:
     def _handle_failure(self, job: Job, run_id: str, paths: WorkspacePaths, error: str):
         """Handle job failure."""
         try:
-            # Add needs-human label
+            # Remove in-progress, add needs-human
+            self.github.remove_label(job.repo, job.target_number, self.config.labels.in_progress)
             self.github.add_label(job.repo, job.target_number, self.config.labels.needs_human)
+
+            # Unassign the bot
+            login = self.github.get_authenticated_user()
+            self.github.unassign_issue(job.repo, job.target_number, login)
 
             # Comment on issue
             self.github.create_comment(
@@ -357,11 +361,16 @@ class Worker:
 
     def _handle_no_changes(self, job: Job, run_id: str, paths: WorkspacePaths):
         """Handle case where Claude made no changes."""
-        self.db.update_run_status(run_id, RunStatus.SUCCEEDED)
+        self.db.update_run_status(run_id, RunStatus.NEEDS_HUMAN)
 
         try:
-            # Remove in-progress label
+            # Remove in-progress, add needs-human (ready was already removed at claim time)
             self.github.remove_label(job.repo, job.target_number, self.config.labels.in_progress)
+            self.github.add_label(job.repo, job.target_number, self.config.labels.needs_human)
+
+            # Unassign the bot
+            login = self.github.get_authenticated_user()
+            self.github.unassign_issue(job.repo, job.target_number, login)
 
             # Comment
             self.github.create_comment(

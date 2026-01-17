@@ -95,10 +95,14 @@ cfg["paths"]["db_path"] = "$DB_PATH"
 p.write_text(yaml.safe_dump(cfg, sort_keys=False, default_flow_style=False))
 PY
 
-# stop timers before updating services (ignore errors if not running)
-echo "Updating systemd units..."
+# stop timers and any running services before updating
+echo "Stopping services..."
 systemctl stop claude-github-runner.timer 2>/dev/null || true
 systemctl stop claude-github-runner-reap.timer 2>/dev/null || true
+systemctl stop claude-github-runner.service 2>/dev/null || true
+systemctl stop claude-github-runner-reap.service 2>/dev/null || true
+
+echo "Updating systemd units..."
 
 # install/update systemd units
 cp "$RUNNER_DIR/systemd/"*.service /etc/systemd/system/
