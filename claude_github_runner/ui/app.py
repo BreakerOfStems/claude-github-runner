@@ -1,6 +1,5 @@
 """Main TUI application."""
 
-import asyncio
 import subprocess
 import shutil
 from datetime import datetime
@@ -84,7 +83,6 @@ class RunsTableScreen(Screen):
         self.logs = logs
         self.controller = controller
         self.workspace_root = workspace_root
-        self._refresh_task: Optional[asyncio.Task] = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -104,13 +102,8 @@ class RunsTableScreen(Screen):
             "Run ID", "Repo", "Target", "Type", "Status", "PID", "Started", "PR"
         )
         self._refresh_runs()
-        self._refresh_task = asyncio.create_task(self._auto_refresh())
-
-    async def _auto_refresh(self) -> None:
-        """Auto-refresh runs every second."""
-        while True:
-            await asyncio.sleep(1)
-            self._refresh_runs()
+        # Use Textual's set_interval for periodic refresh
+        self.set_interval(1.0, self._refresh_runs)
 
     def _refresh_runs(self) -> None:
         """Refresh the runs table."""
@@ -180,8 +173,6 @@ class RunsTableScreen(Screen):
 
     def action_quit(self) -> None:
         """Quit the app."""
-        if self._refresh_task:
-            self._refresh_task.cancel()
         self.app.exit()
 
     def action_logs(self) -> None:
@@ -407,12 +398,13 @@ class ServiceLogsScreen(Screen):
         yield Static("", id="toast")
         yield Footer()
 
-    async def on_mount(self) -> None:
+    def on_mount(self) -> None:
         """Start streaming logs."""
         self._stream = JournalLogStream(self.controller.service_name)
-        asyncio.create_task(self._stream_logs())
+        self._start_streaming()
 
-    async def _stream_logs(self) -> None:
+    @work(exclusive=True)
+    async def _start_streaming(self) -> None:
         """Stream logs to the viewer."""
         log_viewer = self.query_one("#service-log", Log)
 
