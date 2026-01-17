@@ -74,8 +74,8 @@ class Worker:
         # Update status to claimed
         self.db.update_run_status(run_id, RunStatus.CLAIMED, pid=os.getpid())
 
-        # Claim on GitHub
-        self._claim_on_github(job)
+        # Claim on GitHub and post starting comment
+        self._claim_on_github(job, run_id)
 
         # Clone repository
         logger.info(f"Cloning {job.repo}")
@@ -148,8 +148,8 @@ class Worker:
         # Cleanup
         self.workspace_manager.cleanup(run_id, success=True)
 
-    def _claim_on_github(self, job: Job):
-        """Claim the issue/PR on GitHub."""
+    def _claim_on_github(self, job: Job, run_id: str):
+        """Claim the issue/PR on GitHub and post starting comment."""
         try:
             # Add in-progress label
             self.github.add_label(job.repo, job.target_number, self.config.labels.in_progress)
@@ -157,6 +157,22 @@ class Worker:
             # Assign to self
             login = self.github.get_authenticated_user()
             self.github.assign_issue(job.repo, job.target_number, login)
+
+            # Post starting comment
+            if job.comment:
+                # Responding to a mention
+                self.github.create_comment(
+                    job.repo,
+                    job.target_number,
+                    f"🤖 Thanks @{job.comment.author}! I'm starting work on this now.\n\n`Run ID: {run_id}`"
+                )
+            else:
+                # Starting from ready label
+                self.github.create_comment(
+                    job.repo,
+                    job.target_number,
+                    f"🤖 I'm starting work on this issue now.\n\n`Run ID: {run_id}`"
+                )
 
             logger.info(f"Claimed {job.repo}#{job.target_number}")
         except Exception as e:
