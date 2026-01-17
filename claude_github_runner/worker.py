@@ -206,17 +206,34 @@ class Worker:
             ])
 
         lines.extend([
-            "## Important: Unattended Execution",
+            "## Execution Mode: Unattended/Headless",
             "",
-            "You are running in unattended/headless mode. Follow these rules strictly:",
+            "You are running as an automated agent. There is no human watching. Your output will be captured and reviewed later.",
             "",
-            "1. **Do NOT ask questions** - make reasonable decisions based on context",
-            "2. **Do NOT wait for approval** - proceed with implementation",
-            "3. **If genuinely blocked** (missing critical info, ambiguous requirements that could go very wrong), stop and write a clear explanation of what you need to proceed. Do not make changes if you cannot determine the correct approach.",
-            "4. **Do NOT push to main/master** - work on the feature branch only",
-            "5. Keep changes minimal and focused on the task",
-            "6. Run any existing tests/checks if present",
-            "7. Follow the existing code style and conventions",
+            "### What you MUST do:",
+            "- Make reasonable decisions based on available context",
+            "- Proceed with implementation without waiting for approval",
+            "- Explore the codebase to understand patterns and conventions",
+            "- Create or modify files as needed to complete the task",
+            "- Keep changes minimal and focused",
+            "- Follow existing code style and conventions",
+            "",
+            "### What you must NOT do:",
+            "- Do NOT ask questions or wait for input",
+            "- Do NOT push to main/master branch",
+            "- Do NOT make changes if requirements are fundamentally ambiguous",
+            "",
+            "### If you cannot complete the task:",
+            "",
+            "If you are genuinely blocked and cannot proceed, you MUST output a clear handoff message.",
+            "Your final output should explain:",
+            "",
+            "1. **What you tried** - what steps you took, what you looked at",
+            "2. **Why you're blocked** - specific missing info, ambiguity, or technical issue",
+            "3. **What you need** - specific questions or information that would unblock you",
+            "4. **Suggested next steps** - what the human should do or clarify",
+            "",
+            "This output will be posted as a comment on the issue so the human knows exactly how to help.",
             "",
         ])
 
@@ -237,28 +254,42 @@ class Worker:
         ]
 
         logger.info(f"Running Claude in: {paths.repo}")
-        logger.debug(f"Command: {' '.join(cmd[:3])}...")
+        logger.info(f"Log file: {paths.claude_log}")
 
-        with open(paths.claude_log, "w") as log_file:
-            result = subprocess.run(
+        # Stream output to files in real-time so we can tail them
+        stdout_path = paths.root / "claude_stdout.log"
+        stderr_path = paths.root / "claude_stderr.log"
+
+        with open(stdout_path, "w") as stdout_file, open(stderr_path, "w") as stderr_file:
+            process = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=stdout_file,
+                stderr=stderr_file,
                 text=True,
                 cwd=paths.repo,
-                timeout=self.config.timeouts.run_timeout_minutes * 60,
             )
 
-            # Write stdout and stderr to log
-            log_file.write("=== STDOUT ===\n")
-            log_file.write(result.stdout)
-            log_file.write("\n=== STDERR ===\n")
-            log_file.write(result.stderr)
+            try:
+                returncode = process.wait(timeout=self.config.timeouts.run_timeout_minutes * 60)
+            except subprocess.TimeoutExpired:
+                logger.warning(f"Claude timed out after {self.config.timeouts.run_timeout_minutes} minutes")
+                process.kill()
+                process.wait()
+                returncode = -1
 
-        if result.returncode != 0:
-            logger.warning(f"Claude exited with code {result.returncode}")
+        # Combine into single log file for compatibility
+        with open(paths.claude_log, "w") as log_file:
+            log_file.write("=== STDOUT ===\n")
+            log_file.write(stdout_path.read_text())
+            log_file.write("\n=== STDERR ===\n")
+            log_file.write(stderr_path.read_text())
+
+        if returncode != 0:
+            logger.warning(f"Claude exited with code {returncode}")
             # Log stderr for debugging
-            if result.stderr:
-                for line in result.stderr.strip().split('\n')[:10]:
+            stderr_content = stderr_path.read_text().strip()
+            if stderr_content:
+                for line in stderr_content.split('\n')[:10]:
                     logger.warning(f"Claude stderr: {line}")
             # Don't raise - Claude might have made partial progress
 
@@ -375,6 +406,19 @@ class Worker:
         """Handle case where Claude made no changes."""
         self.db.update_run_status(run_id, RunStatus.NEEDS_HUMAN)
 
+        # Read Claude's output to include in the handoff comment
+        claude_output = ""
+        if paths.claude_log.exists():
+            try:
+                log_content = paths.claude_log.read_text()
+                # Extract stdout section (Claude's actual response)
+                if "=== STDOUT ===" in log_content:
+                    stdout_start = log_content.index("=== STDOUT ===") + len("=== STDOUT ===\n")
+                    stdout_end = log_content.index("\n=== STDERR ===") if "\n=== STDERR ===" in log_content else len(log_content)
+                    claude_output = log_content[stdout_start:stdout_end].strip()
+            except Exception as e:
+                logger.warning(f"Failed to read claude.log: {e}")
+
         try:
             # Remove in-progress, add needs-human (ready was already removed at claim time)
             self.github.remove_label(job.repo, job.target_number, self.config.labels.in_progress)
@@ -384,12 +428,16 @@ class Worker:
             login = self.github.get_authenticated_user()
             self.github.unassign_issue(job.repo, job.target_number, login)
 
-            # Comment
-            self.github.create_comment(
-                job.repo,
-                job.target_number,
-                "🤖 I analyzed this issue but didn't identify any code changes to make. This might need human review or more specific guidance."
-            )
+            # Build comment with Claude's output if available
+            if claude_output:
+                # Truncate if too long for GitHub comment
+                if len(claude_output) > 3000:
+                    claude_output = claude_output[:3000] + "\n\n... (truncated)"
+                comment = f"🤖 I wasn't able to complete this task. Here's what happened:\n\n{claude_output}\n\n---\n`Run ID: {run_id}`"
+            else:
+                comment = f"🤖 I analyzed this issue but didn't identify any code changes to make. This might need human review or more specific guidance.\n\n`Run ID: {run_id}`"
+
+            self.github.create_comment(job.repo, job.target_number, comment)
         except Exception as e:
             logger.warning(f"Failed to update GitHub on no-changes: {e}")
 
