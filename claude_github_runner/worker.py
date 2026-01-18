@@ -257,17 +257,29 @@ class Worker:
             "",
             "You are running as an automated agent. There is no human watching. Your output will be captured and reviewed later.",
             "",
+            "### Your workflow:",
+            "1. Explore the codebase to understand patterns and conventions",
+            "2. Implement the requested changes",
+            "3. Commit your changes with a descriptive message",
+            "4. Push to the current branch (you're already on a feature branch)",
+            f"5. Create a Pull Request with a clear description that includes `Closes #{job.target_number}` to link it to this issue",
+            "",
+            "### PR Description Requirements:",
+            "Your PR description MUST include:",
+            "- A summary of what was implemented",
+            f"- The text `Closes #{job.target_number}` (this links and auto-closes the issue when merged)",
+            "- Any important implementation notes or decisions made",
+            "",
             "### What you MUST do:",
             "- Make reasonable decisions based on available context",
             "- Proceed with implementation without waiting for approval",
-            "- Explore the codebase to understand patterns and conventions",
-            "- Create or modify files as needed to complete the task",
             "- Keep changes minimal and focused",
             "- Follow existing code style and conventions",
+            "- Create a PR when done - do not just leave uncommitted changes",
             "",
             "### What you must NOT do:",
             "- Do NOT ask questions or wait for input",
-            "- Do NOT push to main/master branch",
+            "- Do NOT push to main/master branch directly",
             "- Do NOT make changes if requirements are fundamentally ambiguous",
             "",
             "### If you cannot complete the task:",
@@ -393,15 +405,15 @@ class Worker:
             )
 
     def _build_pr_body(self, job: Job, paths: WorkspacePaths) -> str:
-        """Build PR body."""
+        """Build PR body for fallback when Claude doesn't create a PR itself."""
         lines = [
             f"## Summary",
             "",
-            f"Automated implementation for #{job.target_number}.",
+            f"Automated implementation for #{job.target_number}: {job.issue.title}",
             "",
         ]
 
-        # Add closing keyword for issues (not PRs)
+        # Add closing keyword for issues (this is critical for auto-close)
         if job.job_type == JobType.ISSUE_READY:
             lines.extend([
                 f"Closes #{job.target_number}",
@@ -412,9 +424,6 @@ class Worker:
                 f"Related to #{job.target_number}",
                 "",
             ])
-
-        lines.append(f"**Type:** {job.job_type.value}")
-        lines.append("")
 
         if job.comment:
             lines.extend([
