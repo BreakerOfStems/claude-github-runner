@@ -83,8 +83,20 @@ class Worker:
 
         git = Git(paths.repo)
 
+        # Determine base branch - use config override or auto-detect from repo
+        base_branch = self.config.branching.base_branch
+        if base_branch == "main":
+            # Default value - auto-detect the actual default branch
+            try:
+                detected_branch = self.github.get_default_branch(job.repo)
+                if detected_branch:
+                    base_branch = detected_branch
+                    logger.info(f"Auto-detected default branch: {base_branch}")
+            except Exception as e:
+                logger.warning(f"Failed to detect default branch, using 'main': {e}")
+
         # Checkout base branch
-        git.checkout(self.config.branching.base_branch)
+        git.checkout(base_branch)
 
         # Create working branch
         slug = slugify(job.issue.title)
@@ -97,7 +109,7 @@ class Worker:
             logger.info(f"Branch {branch_name} exists on remote, checking out")
             git.checkout(branch_name)
             # Try to rebase onto base branch
-            if not git.rebase(f"origin/{self.config.branching.base_branch}"):
+            if not git.rebase(f"origin/{base_branch}"):
                 logger.warning("Rebase failed, handling conflicts")
                 git.abort_rebase()
                 self._handle_merge_conflict(job, run_id, paths, git)
@@ -120,9 +132,11 @@ class Worker:
         # 4. Did nothing
 
         has_uncommitted = bool(git.status())
-        has_new_commits = git.has_commits_ahead_of(f"origin/{self.config.branching.base_branch}")
+        has_new_commits = git.has_commits_ahead_of(f"origin/{base_branch}")
 
-        # Check if Claude already created a PR
+        logger.info(f"Post-Claude state: uncommitted={has_uncommitted}, new_commits={has_new_commits}")
+
+        # Check if Claude already created a PR (on our branch or any branch)
         existing_pr = self.github.get_pr_for_branch(job.repo, branch_name)
         if existing_pr:
             logger.info(f"Claude already created PR: {existing_pr.url}")
@@ -131,6 +145,19 @@ class Worker:
             self._write_summary(paths, run_id, job, "succeeded", pr_url=existing_pr.url)
             self.workspace_manager.cleanup(run_id, success=True)
             return
+
+        # Also check the current branch (Claude might have renamed it)
+        current_branch = git.get_current_branch()
+        if current_branch != branch_name:
+            logger.info(f"Branch changed: expected {branch_name}, got {current_branch}")
+            existing_pr = self.github.get_pr_for_branch(job.repo, current_branch)
+            if existing_pr:
+                logger.info(f"Found PR on current branch: {existing_pr.url}")
+                self.db.update_run_status(run_id, RunStatus.SUCCEEDED, pr_url=existing_pr.url)
+                self._handle_success(job, run_id, paths, existing_pr.url)
+                self._write_summary(paths, run_id, job, "succeeded", pr_url=existing_pr.url)
+                self.workspace_manager.cleanup(run_id, success=True)
+                return
 
         if not has_uncommitted and not has_new_commits:
             logger.info("No changes made by Claude")
@@ -151,12 +178,12 @@ class Worker:
                     return
 
         # Push if there are unpushed commits
-        if git.has_unpushed_commits(self.config.branching.base_branch):
+        if git.has_unpushed_commits(base_branch):
             logger.info(f"Pushing branch {branch_name}")
             git.push("origin", branch_name, set_upstream=True)
 
         # Create or update PR
-        pr_url = self._create_or_update_pr(job, branch_name, paths)
+        pr_url = self._create_or_update_pr(job, branch_name, paths, base_branch)
         self.db.update_run_status(run_id, RunStatus.SUCCEEDED, pr_url=pr_url)
 
         # Update labels on success
@@ -271,8 +298,10 @@ class Worker:
 
         return "\n".join(lines)
 
-    def _invoke_claude(self, paths: WorkspacePaths, run_id: str):
+    def _invoke_claude(self, paths: WorkspacePaths, run_id: str, retry_count: int = 0):
         """Invoke Claude Code non-interactively."""
+        MAX_RETRIES = 1  # Retry once on auth errors
+
         # Build command for headless execution:
         # --dangerously-skip-permissions: skip tool permission checks (from config)
         # -p: provide the prompt
@@ -307,6 +336,17 @@ class Worker:
                 process.wait()
                 returncode = -1
 
+        # Check for auth errors that might be recoverable with retry
+        stdout_content = stdout_path.read_text()
+        if "authentication_error" in stdout_content or "OAuth token has expired" in stdout_content:
+            if retry_count < MAX_RETRIES:
+                logger.warning(f"Auth error detected, retrying (attempt {retry_count + 2})...")
+                import time
+                time.sleep(2)  # Brief pause before retry
+                return self._invoke_claude(paths, run_id, retry_count + 1)
+            else:
+                logger.error("Auth error persists after retry - token may need manual refresh")
+
         # Combine into single log file for compatibility
         with open(paths.claude_log, "w") as log_file:
             log_file.write("=== STDOUT ===\n")
@@ -335,7 +375,7 @@ class Worker:
         ]
         return "\n".join(lines)
 
-    def _create_or_update_pr(self, job: Job, branch_name: str, paths: WorkspacePaths) -> str:
+    def _create_or_update_pr(self, job: Job, branch_name: str, paths: WorkspacePaths, base_branch: str) -> str:
         """Create or update a PR. Returns PR URL."""
         # Check if PR already exists
         existing_pr = self.github.get_pr_for_branch(job.repo, branch_name)
@@ -360,7 +400,7 @@ class Worker:
                 title=pr_title,
                 body=pr_body,
                 head_branch=branch_name,
-                base_branch=self.config.branching.base_branch,
+                base_branch=base_branch,
                 working_dir=str(paths.repo),
             )
 

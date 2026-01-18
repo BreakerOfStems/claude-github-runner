@@ -75,6 +75,11 @@ class GitHub:
             self._login = result.stdout.strip()
         return self._login
 
+    def get_default_branch(self, repo: str) -> str:
+        """Get the repository's default branch."""
+        result = self._run_gh(["api", f"repos/{repo}", "-q", ".default_branch"])
+        return result.stdout.strip()
+
     def search_ready_issues(
         self,
         repo: str,
