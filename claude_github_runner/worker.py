@@ -83,8 +83,20 @@ class Worker:
 
         git = Git(paths.repo)
 
+        # Determine base branch - use config override or auto-detect from repo
+        base_branch = self.config.branching.base_branch
+        if base_branch == "main":
+            # Default value - auto-detect the actual default branch
+            try:
+                detected_branch = self.github.get_default_branch(job.repo)
+                if detected_branch:
+                    base_branch = detected_branch
+                    logger.info(f"Auto-detected default branch: {base_branch}")
+            except Exception as e:
+                logger.warning(f"Failed to detect default branch, using 'main': {e}")
+
         # Checkout base branch
-        git.checkout(self.config.branching.base_branch)
+        git.checkout(base_branch)
 
         # Create working branch
         slug = slugify(job.issue.title)
@@ -97,7 +109,7 @@ class Worker:
             logger.info(f"Branch {branch_name} exists on remote, checking out")
             git.checkout(branch_name)
             # Try to rebase onto base branch
-            if not git.rebase(f"origin/{self.config.branching.base_branch}"):
+            if not git.rebase(f"origin/{base_branch}"):
                 logger.warning("Rebase failed, handling conflicts")
                 git.abort_rebase()
                 self._handle_merge_conflict(job, run_id, paths, git)
@@ -120,7 +132,7 @@ class Worker:
         # 4. Did nothing
 
         has_uncommitted = bool(git.status())
-        has_new_commits = git.has_commits_ahead_of(f"origin/{self.config.branching.base_branch}")
+        has_new_commits = git.has_commits_ahead_of(f"origin/{base_branch}")
 
         logger.info(f"Post-Claude state: uncommitted={has_uncommitted}, new_commits={has_new_commits}")
 
@@ -166,12 +178,12 @@ class Worker:
                     return
 
         # Push if there are unpushed commits
-        if git.has_unpushed_commits(self.config.branching.base_branch):
+        if git.has_unpushed_commits(base_branch):
             logger.info(f"Pushing branch {branch_name}")
             git.push("origin", branch_name, set_upstream=True)
 
         # Create or update PR
-        pr_url = self._create_or_update_pr(job, branch_name, paths)
+        pr_url = self._create_or_update_pr(job, branch_name, paths, base_branch)
         self.db.update_run_status(run_id, RunStatus.SUCCEEDED, pr_url=pr_url)
 
         # Update labels on success
@@ -351,7 +363,7 @@ class Worker:
         ]
         return "\n".join(lines)
 
-    def _create_or_update_pr(self, job: Job, branch_name: str, paths: WorkspacePaths) -> str:
+    def _create_or_update_pr(self, job: Job, branch_name: str, paths: WorkspacePaths, base_branch: str) -> str:
         """Create or update a PR. Returns PR URL."""
         # Check if PR already exists
         existing_pr = self.github.get_pr_for_branch(job.repo, branch_name)
@@ -376,7 +388,7 @@ class Worker:
                 title=pr_title,
                 body=pr_body,
                 head_branch=branch_name,
-                base_branch=self.config.branching.base_branch,
+                base_branch=base_branch,
                 working_dir=str(paths.repo),
             )
 
