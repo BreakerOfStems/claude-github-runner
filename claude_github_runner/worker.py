@@ -122,7 +122,9 @@ class Worker:
         has_uncommitted = bool(git.status())
         has_new_commits = git.has_commits_ahead_of(f"origin/{self.config.branching.base_branch}")
 
-        # Check if Claude already created a PR
+        logger.info(f"Post-Claude state: uncommitted={has_uncommitted}, new_commits={has_new_commits}")
+
+        # Check if Claude already created a PR (on our branch or any branch)
         existing_pr = self.github.get_pr_for_branch(job.repo, branch_name)
         if existing_pr:
             logger.info(f"Claude already created PR: {existing_pr.url}")
@@ -131,6 +133,19 @@ class Worker:
             self._write_summary(paths, run_id, job, "succeeded", pr_url=existing_pr.url)
             self.workspace_manager.cleanup(run_id, success=True)
             return
+
+        # Also check the current branch (Claude might have renamed it)
+        current_branch = git.get_current_branch()
+        if current_branch != branch_name:
+            logger.info(f"Branch changed: expected {branch_name}, got {current_branch}")
+            existing_pr = self.github.get_pr_for_branch(job.repo, current_branch)
+            if existing_pr:
+                logger.info(f"Found PR on current branch: {existing_pr.url}")
+                self.db.update_run_status(run_id, RunStatus.SUCCEEDED, pr_url=existing_pr.url)
+                self._handle_success(job, run_id, paths, existing_pr.url)
+                self._write_summary(paths, run_id, job, "succeeded", pr_url=existing_pr.url)
+                self.workspace_manager.cleanup(run_id, success=True)
+                return
 
         if not has_uncommitted and not has_new_commits:
             logger.info("No changes made by Claude")
@@ -359,10 +374,22 @@ class Worker:
             "",
             f"Automated implementation for #{job.target_number}.",
             "",
-            f"**Issue/PR:** #{job.target_number}",
-            f"**Type:** {job.job_type.value}",
-            "",
         ]
+
+        # Add closing keyword for issues (not PRs)
+        if job.job_type == JobType.ISSUE_READY:
+            lines.extend([
+                f"Closes #{job.target_number}",
+                "",
+            ])
+        else:
+            lines.extend([
+                f"Related to #{job.target_number}",
+                "",
+            ])
+
+        lines.append(f"**Type:** {job.job_type.value}")
+        lines.append("")
 
         if job.comment:
             lines.extend([
