@@ -28,7 +28,11 @@ fi
 # prereqs
 echo "Installing system dependencies..."
 apt update
-apt install -y git python3 python3-venv python3-pip
+apt install -y git python3 python3-venv python3-pip nodejs npm
+
+# install/update Claude Code CLI
+echo "Installing/updating Claude Code..."
+npm install -g @anthropic-ai/claude-code
 
 # clone/update into /opt
 echo "Fetching latest code..."

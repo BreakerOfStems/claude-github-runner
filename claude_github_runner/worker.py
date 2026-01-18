@@ -259,8 +259,10 @@ class Worker:
 
         return "\n".join(lines)
 
-    def _invoke_claude(self, paths: WorkspacePaths, run_id: str):
+    def _invoke_claude(self, paths: WorkspacePaths, run_id: str, retry_count: int = 0):
         """Invoke Claude Code non-interactively."""
+        MAX_RETRIES = 1  # Retry once on auth errors
+
         # Build command for headless execution:
         # --dangerously-skip-permissions: skip tool permission checks (from config)
         # -p: provide the prompt
@@ -294,6 +296,17 @@ class Worker:
                 process.kill()
                 process.wait()
                 returncode = -1
+
+        # Check for auth errors that might be recoverable with retry
+        stdout_content = stdout_path.read_text()
+        if "authentication_error" in stdout_content or "OAuth token has expired" in stdout_content:
+            if retry_count < MAX_RETRIES:
+                logger.warning(f"Auth error detected, retrying (attempt {retry_count + 2})...")
+                import time
+                time.sleep(2)  # Brief pause before retry
+                return self._invoke_claude(paths, run_id, retry_count + 1)
+            else:
+                logger.error("Auth error persists after retry - token may need manual refresh")
 
         # Combine into single log file for compatibility
         with open(paths.claude_log, "w") as log_file:
