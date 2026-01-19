@@ -42,6 +42,13 @@ class PathsConfig:
 
 
 @dataclass
+class RetryConfig:
+    max_retries: int = 1  # Number of retry attempts on auth errors
+    initial_delay_seconds: int = 5  # Initial delay before first retry
+    backoff_multiplier: float = 2.0  # Multiplier for exponential backoff
+
+
+@dataclass
 class ClaudeConfig:
     command: str = "claude"
     non_interactive_args: list[str] = field(default_factory=lambda: ["--dangerously-skip-permissions"])
@@ -71,6 +78,7 @@ class Config:
     claude: ClaudeConfig = field(default_factory=ClaudeConfig)
     priorities: PrioritiesConfig = field(default_factory=PrioritiesConfig)
     cleanup: CleanupConfig = field(default_factory=CleanupConfig)
+    retry: RetryConfig = field(default_factory=RetryConfig)
 
     @classmethod
     def from_dict(cls, data: dict) -> "Config":
@@ -138,6 +146,14 @@ class Config:
                 on_success=cleanup.get("on_success", config.cleanup.on_success),
                 on_failure=cleanup.get("on_failure", config.cleanup.on_failure),
                 keep_hours=cleanup.get("keep_hours", config.cleanup.keep_hours),
+            )
+
+        if "retry" in data:
+            retry = data["retry"]
+            config.retry = RetryConfig(
+                max_retries=retry.get("max_retries", config.retry.max_retries),
+                initial_delay_seconds=retry.get("initial_delay_seconds", config.retry.initial_delay_seconds),
+                backoff_multiplier=retry.get("backoff_multiplier", config.retry.backoff_multiplier),
             )
 
         return config
