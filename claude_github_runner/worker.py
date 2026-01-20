@@ -38,24 +38,31 @@ class Worker:
         self.github = github
         self.workspace_manager = workspace_manager
 
-    def execute(self, job: Job, comment_id: Optional[int] = None) -> str:
-        """Execute a job. Returns the run_id."""
-        run_id = f"{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    def execute(self, job: Job, comment_id: Optional[int] = None, run_id: Optional[str] = None) -> str:
+        """Execute a job. Returns the run_id.
 
-        logger.info(f"Starting run {run_id} for {job.repo}#{job.target_number} ({job.job_type.value})")
+        If run_id is provided, uses the existing run record (created by tick before spawning).
+        Otherwise creates a new run record (for manual runs).
+        """
+        if run_id:
+            # Using existing run record created by tick()
+            logger.info(f"Using existing run {run_id} for {job.repo}#{job.target_number} ({job.job_type.value})")
+        else:
+            # Manual run - create new run record
+            run_id = f"{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+            logger.info(f"Starting run {run_id} for {job.repo}#{job.target_number} ({job.job_type.value})")
 
-        # Create run record
-        run = Run(
-            run_id=run_id,
-            repo=job.repo,
-            target_number=job.target_number,
-            job_type=job.job_type,
-            status=RunStatus.QUEUED,
-        )
+            run = Run(
+                run_id=run_id,
+                repo=job.repo,
+                target_number=job.target_number,
+                job_type=job.job_type,
+                status=RunStatus.QUEUED,
+            )
 
-        if not self.db.create_run(run):
-            logger.error(f"Failed to create run: active run exists for {job.repo}#{job.target_number}")
-            raise RuntimeError("Active run exists for target")
+            if not self.db.create_run(run):
+                logger.error(f"Failed to create run: active run exists for {job.repo}#{job.target_number}")
+                raise RuntimeError("Active run exists for target")
 
         # Create workspace
         paths = self.workspace_manager.create(run_id)

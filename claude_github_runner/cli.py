@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import Optional
 
 from .config import Config
-from .database import Database, RunStatus, JobType
+from .database import Database, Run, RunStatus, JobType
+import uuid
 from .discovery import Discovery, Job
 from .github import GitHub, GitHubError
 from .worker import Worker
@@ -90,16 +91,36 @@ class Runner:
                         continue
                     comment_id = job.comment.id
 
+                # Create run record BEFORE spawning to prevent re-discovery
+                # If subprocess fails to start, the record prevents infinite loops
+                run_id = f"{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+                run = Run(
+                    run_id=run_id,
+                    repo=job.repo,
+                    target_number=job.target_number,
+                    job_type=job.job_type,
+                    status=RunStatus.QUEUED,
+                )
+
+                if not self.db.create_run(run):
+                    logger.warning(f"Active run exists for {job.repo}#{job.target_number}, skipping")
+                    continue
+
                 # Spawn worker as background subprocess
                 # The subprocess handles all job execution independently:
+                # - Uses the existing run record (by run_id)
                 # - Creates its own workspace
                 # - Clones the correct repo
                 # - Runs Claude Code in that workspace
                 # - Updates database with results
-                process = self._spawn_worker(job, comment_id)
+                process = self._spawn_worker(job, run_id, comment_id)
+
+                # Update record with PID
+                self.db.update_run_status(run_id, RunStatus.QUEUED, pid=process.pid)
 
                 results.append({
                     "job": f"{job.repo}#{job.target_number}",
+                    "run_id": run_id,
                     "pid": process.pid,
                     "status": "spawned",
                 })
@@ -114,9 +135,11 @@ class Runner:
         logger.info(f"Tick complete: {len(results)} jobs spawned")
         return {"status": "ok", "jobs": results}
 
-    def run_single(self, repo: str, number: int, comment_id: Optional[int] = None) -> str:
-        """Execute a single job manually."""
-        logger.info(f"Manual run for {repo}#{number}")
+    def run_single(
+        self, repo: str, number: int, comment_id: Optional[int] = None, run_id: Optional[str] = None
+    ) -> str:
+        """Execute a single job manually or as spawned worker."""
+        logger.info(f"Run for {repo}#{number}" + (f" (run_id={run_id})" if run_id else " (manual)"))
 
         # Get issue details
         issue = self.github.get_issue(repo, number)
@@ -138,9 +161,10 @@ class Runner:
                 comment=comment,
             )
 
-            # Mark comment as processed
-            run_id_preview = f"{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-manual"
-            self.discovery.mark_comment_processed(job, run_id_preview)
+            # Mark comment as processed (only for manual runs without existing run_id)
+            if not run_id:
+                run_id_preview = f"{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-manual"
+                self.discovery.mark_comment_processed(job, run_id_preview)
         else:
             job = Job(
                 repo=repo,
@@ -149,7 +173,7 @@ class Runner:
                 issue=issue,
             )
 
-        return self.worker.execute(job)
+        return self.worker.execute(job, run_id=run_id)
 
     def reap(self) -> dict:
         """Detect dead PIDs and mark stale runs."""
@@ -222,7 +246,7 @@ class Runner:
 
         return self.config.polling.max_concurrency - active_count
 
-    def _spawn_worker(self, job: Job, comment_id: Optional[int] = None) -> subprocess.Popen:
+    def _spawn_worker(self, job: Job, run_id: str, comment_id: Optional[int] = None) -> subprocess.Popen:
         """Spawn a worker subprocess to handle a job.
 
         Each worker runs in its own process with isolated context (working directory,
@@ -234,6 +258,7 @@ class Runner:
             "run",
             "--repo", job.repo,
             "--number", str(job.target_number),
+            "--run-id", run_id,
         ]
 
         if comment_id:
@@ -338,6 +363,10 @@ def main():
         type=int,
         help="Comment ID for mention jobs",
     )
+    run_parser.add_argument(
+        "--run-id",
+        help="Existing run ID (created by tick before spawning)",
+    )
 
     # reap command
     reap_parser = subparsers.add_parser(
@@ -413,7 +442,7 @@ def main():
             print(f"Tick result: {result}")
 
         elif args.command == "run":
-            run_id = runner.run_single(args.repo, args.number, args.comment_id)
+            run_id = runner.run_single(args.repo, args.number, args.comment_id, args.run_id)
             print(f"Run completed: {run_id}")
 
         elif args.command == "reap":
