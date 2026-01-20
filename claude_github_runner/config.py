@@ -79,6 +79,7 @@ class Config:
     priorities: PrioritiesConfig = field(default_factory=PrioritiesConfig)
     cleanup: CleanupConfig = field(default_factory=CleanupConfig)
     retry: RetryConfig = field(default_factory=RetryConfig)
+    _config_path: Optional[str] = field(default=None, repr=False)  # Track source config path for spawned workers
 
     @classmethod
     def from_dict(cls, data: dict) -> "Config":
@@ -161,7 +162,8 @@ class Config:
     @classmethod
     def load(cls, config_path: Optional[str] = None) -> "Config":
         """Load configuration from file."""
-        if config_path is None:
+        resolved_path = config_path
+        if resolved_path is None:
             # Default locations to check
             candidates = [
                 Path("/etc/claude-github-runner/config.yml"),
@@ -171,13 +173,15 @@ class Config:
             ]
             for candidate in candidates:
                 if candidate.exists():
-                    config_path = str(candidate)
+                    resolved_path = str(candidate)
                     break
 
-        if config_path and Path(config_path).exists():
-            with open(config_path, "r") as f:
+        if resolved_path and Path(resolved_path).exists():
+            with open(resolved_path, "r") as f:
                 data = yaml.safe_load(f) or {}
-            return cls.from_dict(data)
+            config = cls.from_dict(data)
+            config._config_path = resolved_path
+            return config
 
         return cls()
 
