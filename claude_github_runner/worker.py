@@ -106,16 +106,26 @@ class Worker:
         if pid == 0:
             # Child process - execute the job
             try:
-                # Reinitialize logging for child process
-                logging.basicConfig(
-                    level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                # Set up file-based logging for the child process
+                # This is critical because stdout/stderr may be closed after parent exits
+                log_file = paths.root / "worker.log"
+                file_handler = logging.FileHandler(log_file)
+                file_handler.setFormatter(logging.Formatter(
+                    "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
                     datefmt="%Y-%m-%d %H:%M:%S",
-                    force=True,
-                )
+                ))
+                root_logger = logging.getLogger()
+                root_logger.handlers.clear()
+                root_logger.addHandler(file_handler)
+                root_logger.setLevel(logging.INFO)
+
+                logger.info(f"Child process started for run {run_id}")
+
                 # Reconnect to database (connection isn't safe to share across fork)
                 self.db = Database(self.config.paths.db_path)
                 self.github = GitHub()
+
+                logger.info("Database and GitHub reconnected")
 
                 self._execute_job(run_id, job, paths)
             except Exception as e:
