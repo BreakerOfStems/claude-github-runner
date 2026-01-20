@@ -395,6 +395,7 @@ class Worker:
         with open(stdout_path, "w") as stdout_file, open(stderr_path, "w") as stderr_file:
             process = subprocess.Popen(
                 cmd,
+                stdin=subprocess.DEVNULL,
                 stdout=stdout_file,
                 stderr=stderr_file,
                 text=True,
