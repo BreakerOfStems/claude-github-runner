@@ -109,8 +109,15 @@ class RunsTableScreen(Screen):
         """Refresh the runs table."""
         table = self.query_one("#runs-table", DataTable)
 
-        # Save current selection
-        current_row = table.cursor_row
+        # Save current selection by run_id (not row index) to preserve position
+        # across refreshes even when row order changes
+        selected_run_id: Optional[str] = None
+        if table.cursor_row is not None and table.row_count > 0:
+            try:
+                row_key = table.coordinate_to_cell_key((table.cursor_row, 0)).row_key
+                selected_run_id = row_key.value
+            except Exception:
+                pass
 
         # Get filter
         filter_map = {
@@ -145,9 +152,13 @@ class RunsTableScreen(Screen):
                 key=run.run_id,
             )
 
-        # Restore selection if possible
-        if current_row is not None and current_row < table.row_count:
-            table.move_cursor(row=current_row)
+        # Restore selection by run_id to maintain cursor position on same run
+        if selected_run_id is not None and table.row_count > 0:
+            # Find the row index for the previously selected run_id
+            for idx, row_key in enumerate(table.rows.keys()):
+                if row_key.value == selected_run_id:
+                    table.move_cursor(row=idx)
+                    break
 
         # Update status bar
         status_bar = self.query_one(StatusBar)
@@ -163,12 +174,14 @@ class RunsTableScreen(Screen):
     def _get_selected_run(self) -> Optional[RunInfo]:
         """Get the currently selected run."""
         table = self.query_one("#runs-table", DataTable)
-        if table.cursor_row is not None:
-            row_key = table.get_row_at(table.cursor_row)
-            if row_key:
-                # The key is stored in row_key, need to get run_id
-                run_id = list(table.rows.keys())[table.cursor_row].value
+        if table.cursor_row is not None and table.row_count > 0:
+            try:
+                # Get the row key using coordinate_to_cell_key for reliable lookup
+                row_key = table.coordinate_to_cell_key((table.cursor_row, 0)).row_key
+                run_id = row_key.value
                 return self.db.get_run(run_id)
+            except Exception:
+                pass
         return None
 
     def action_quit(self) -> None:
