@@ -10,6 +10,10 @@ User=claude
 Group=claude
 WorkingDirectory=/home/claude
 
+# Allow forked worker processes to continue running after tick exits
+# Without this, systemd's default KillMode=control-group kills all children
+KillMode=process
+
 # Main execution
 ExecStart=/usr/local/bin/claude-github-runner tick
 
