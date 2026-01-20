@@ -10,6 +10,10 @@ User=claude
 Group=claude
 WorkingDirectory=/home/claude
 
+# Allow forked worker processes to continue running after tick exits
+# Without this, systemd's default KillMode=control-group kills all children
+KillMode=process
+
 # Main execution
 ExecStart=/usr/local/bin/claude-github-runner tick
 
@@ -23,10 +27,10 @@ StandardError=journal
 SyslogIdentifier=claude-github-runner
 
 # Security hardening
+# Note: We can't use ProtectHome=read-only because Claude Code needs to write
+# config files to the home directory (e.g., ~/.claude.json)
 NoNewPrivileges=yes
 ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=/home/claude/workspace /home/claude/.claude
 PrivateTmp=yes
 
 [Install]
