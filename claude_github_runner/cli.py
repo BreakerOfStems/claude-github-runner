@@ -3,15 +3,12 @@
 import argparse
 import logging
 import os
-import subprocess
 import sys
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
 
 from .config import Config
-from .database import Database, Run, RunStatus, JobType
-import uuid
+from .database import Database, RunStatus, JobType
 from .discovery import Discovery, Job
 from .github import GitHub, GitHubError
 from .worker import Worker
@@ -76,63 +73,35 @@ class Runner:
             logger.info("No jobs to process")
             return {"status": "no_jobs"}
 
-        # Process jobs up to available slots - spawn each as a background process
-        # This enables true concurrent execution: each worker runs independently
-        # with its own isolated context (workspace, working directory, repo clone)
+        # Process jobs up to available slots using os.fork() for concurrency
+        # Each forked process runs independently with its own context
         results = []
         for job in jobs[:available_slots]:
             try:
                 # For mention jobs, mark comment as processed first
-                comment_id = None
                 if job.comment:
                     run_id = f"{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-preview"
                     if not self.discovery.mark_comment_processed(job, run_id):
                         logger.info(f"Comment {job.comment.id} already processed, skipping")
                         continue
-                    comment_id = job.comment.id
 
-                # Create run record BEFORE spawning to prevent re-discovery
-                # If subprocess fails to start, the record prevents infinite loops
-                run_id = f"{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
-                run = Run(
-                    run_id=run_id,
-                    repo=job.repo,
-                    target_number=job.target_number,
-                    job_type=job.job_type,
-                    status=RunStatus.QUEUED,
-                )
-
-                if not self.db.create_run(run):
-                    logger.warning(f"Active run exists for {job.repo}#{job.target_number}, skipping")
-                    continue
-
-                # Spawn worker as background subprocess
-                # The subprocess handles all job execution independently:
-                # - Uses the existing run record (by run_id)
-                # - Creates its own workspace
-                # - Clones the correct repo
-                # - Runs Claude Code in that workspace
-                # - Updates database with results
-                process = self._spawn_worker(job, run_id, comment_id)
-
-                # Update record with PID
-                self.db.update_run_status(run_id, RunStatus.QUEUED, pid=process.pid)
-
+                # Use execute_async which forks and runs in background
+                # This creates the DB record, forks, and returns immediately
+                run_id = self.worker.execute_async(job)
                 results.append({
                     "job": f"{job.repo}#{job.target_number}",
                     "run_id": run_id,
-                    "pid": process.pid,
-                    "status": "spawned",
+                    "status": "started",
                 })
             except Exception as e:
-                logger.exception(f"Failed to spawn job {job.repo}#{job.target_number}: {e}")
+                logger.exception(f"Failed to execute job {job.repo}#{job.target_number}: {e}")
                 results.append({
                     "job": f"{job.repo}#{job.target_number}",
                     "status": "failed",
                     "error": str(e),
                 })
 
-        logger.info(f"Tick complete: {len(results)} jobs spawned")
+        logger.info(f"Tick complete: {len(results)} jobs processed")
         return {"status": "ok", "jobs": results}
 
     def run_single(
@@ -245,51 +214,6 @@ class Runner:
         active_count = sum(1 for run in running_runs if run.pid and is_pid_alive(run.pid))
 
         return self.config.polling.max_concurrency - active_count
-
-    def _spawn_worker(self, job: Job, run_id: str, comment_id: Optional[int] = None) -> subprocess.Popen:
-        """Spawn a worker subprocess to handle a job.
-
-        Each worker runs in its own process with isolated context (working directory,
-        environment, etc.) to ensure jobs across different repos don't interfere.
-        """
-        # Build command to spawn worker subprocess
-        cmd = [
-            sys.executable, "-m", "claude_github_runner",
-            "run",
-            "--repo", job.repo,
-            "--number", str(job.target_number),
-            "--run-id", run_id,
-        ]
-
-        if comment_id:
-            cmd.extend(["--comment-id", str(comment_id)])
-
-        if self.config._config_path:
-            cmd.extend(["--config", self.config._config_path])
-
-        # Open log file for subprocess output
-        log_dir = Path(self.config.paths.workspace_root) / "spawn_logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / f"spawn_{job.repo.replace('/', '_')}_{job.target_number}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.log"
-
-        logger.info(f"Spawning worker for {job.repo}#{job.target_number}, log: {log_file}")
-
-        # Spawn subprocess - runs independently with its own context
-        # Each subprocess will:
-        # 1. Create its own workspace directory
-        # 2. Clone the specific repo
-        # 3. Run Claude in that isolated workspace
-        # 4. Update the database with results
-        with open(log_file, "w") as log_fh:
-            process = subprocess.Popen(
-                cmd,
-                stdout=log_fh,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,  # Detach from parent process group
-            )
-
-        logger.info(f"Spawned worker PID {process.pid} for {job.repo}#{job.target_number}")
-        return process
 
     def status(self) -> dict:
         """Get current status."""
