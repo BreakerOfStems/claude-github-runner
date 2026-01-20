@@ -2,9 +2,11 @@
 
 import json
 import logging
+import multiprocessing
 import os
 import re
 import subprocess
+import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -68,6 +70,60 @@ class Worker:
             raise
 
         return run_id
+
+    def execute_async(self, job: Job, comment_id: Optional[int] = None) -> str:
+        """Execute a job in a background process. Returns the run_id immediately."""
+        run_id = f"{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+
+        logger.info(f"Starting async run {run_id} for {job.repo}#{job.target_number} ({job.job_type.value})")
+
+        # Create run record
+        run = Run(
+            run_id=run_id,
+            repo=job.repo,
+            target_number=job.target_number,
+            job_type=job.job_type,
+            status=RunStatus.QUEUED,
+        )
+
+        if not self.db.create_run(run):
+            logger.error(f"Failed to create run: active run exists for {job.repo}#{job.target_number}")
+            raise RuntimeError("Active run exists for target")
+
+        # Create workspace before forking
+        paths = self.workspace_manager.create(run_id)
+
+        # Fork to a child process
+        pid = os.fork()
+
+        if pid == 0:
+            # Child process - execute the job
+            try:
+                # Reinitialize logging for child process
+                logging.basicConfig(
+                    level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S",
+                    force=True,
+                )
+                # Reconnect to database (connection isn't safe to share across fork)
+                self.db = Database(self.config.paths.db_path)
+                self.github = GitHub()
+
+                self._execute_job(run_id, job, paths)
+            except Exception as e:
+                logger.exception(f"Run {run_id} failed: {e}")
+                self.db.update_run_status(run_id, RunStatus.FAILED, error=str(e))
+                self._handle_failure(job, run_id, paths, str(e))
+                self.workspace_manager.cleanup(run_id, success=False)
+            finally:
+                # Child must exit to avoid returning to parent's control flow
+                os._exit(0)
+        else:
+            # Parent process - record the child PID and return immediately
+            logger.info(f"Spawned child process {pid} for run {run_id}")
+            self.db.update_run_status(run_id, RunStatus.CLAIMED, pid=pid)
+            return run_id
 
     def _execute_job(self, run_id: str, job: Job, paths: WorkspacePaths):
         """Execute the job steps."""
