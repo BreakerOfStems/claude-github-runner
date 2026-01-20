@@ -73,7 +73,9 @@ class Runner:
             logger.info("No jobs to process")
             return {"status": "no_jobs"}
 
-        # Process jobs up to available slots
+        # Start jobs concurrently up to available slots
+        # Using execute_async() spawns each job in a background process,
+        # allowing multiple sessions to start at the same time
         results = []
         for job in jobs[:available_slots]:
             try:
@@ -84,7 +86,7 @@ class Runner:
                         logger.info(f"Comment {job.comment.id} already processed, skipping")
                         continue
 
-                run_id = self.worker.execute(job)
+                run_id = self.worker.execute_async(job)
                 results.append({
                     "job": f"{job.repo}#{job.target_number}",
                     "run_id": run_id,
