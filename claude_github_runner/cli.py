@@ -621,7 +621,19 @@ def main():
                 service_name=args.service_name,
                 timer_name=args.timer_name,
             )
-            app.run()
+            try:
+                app.run()
+            finally:
+                # Reset terminal state to clean up any artifacts from mouse tracking
+                # or other terminal modes that may not have been properly disabled.
+                # This sends escape sequences to:
+                # - Disable SGR mouse tracking (\033[?1006l)
+                # - Disable mouse button tracking (\033[?1000l)
+                # - Disable mouse any-event tracking (\033[?1003l)
+                # - Show cursor (\033[?25h)
+                # - Reset character attributes (\033[0m)
+                sys.stdout.write("\033[?1006l\033[?1003l\033[?1000l\033[?25h\033[0m")
+                sys.stdout.flush()
         except ImportError as e:
             print(f"Error: UI requires 'textual' package. Install with: pip install textual")
             print(f"Details: {e}")
