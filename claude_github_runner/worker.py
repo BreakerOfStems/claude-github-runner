@@ -381,7 +381,15 @@ class Worker:
         stdout_path = paths.root / "claude_stdout.log"
         stderr_path = paths.root / "claude_stderr.log"
 
-        with open(stdout_path, "w") as stdout_file, open(stderr_path, "w") as stderr_file:
+        stdout_file = None
+        stderr_file = None
+        process = None
+        returncode = -1
+
+        try:
+            stdout_file = open(stdout_path, "w")
+            stderr_file = open(stderr_path, "w")
+
             process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.DEVNULL,
@@ -398,6 +406,27 @@ class Worker:
                 process.kill()
                 process.wait()
                 returncode = -1
+        except Exception:
+            # Ensure process is terminated if an error occurs
+            if process is not None:
+                try:
+                    process.kill()
+                    process.wait()
+                except Exception:
+                    pass
+            raise
+        finally:
+            # Always close file handles
+            if stdout_file is not None:
+                try:
+                    stdout_file.close()
+                except Exception:
+                    pass
+            if stderr_file is not None:
+                try:
+                    stderr_file.close()
+                except Exception:
+                    pass
 
         # Check for auth errors that might be recoverable with retry
         stdout_content = stdout_path.read_text()
