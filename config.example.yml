@@ -1,54 +1,350 @@
+# ============================================================================
 # Claude GitHub Runner Configuration
-# Copy to /etc/claude-github-runner/config.yml
+# ============================================================================
+#
+# This file configures the Claude GitHub Runner, a headless service that
+# automatically processes GitHub issues using Claude Code.
+#
+# Configuration Locations (searched in order):
+#   1. /etc/claude-github-runner/config.yml
+#   2. /etc/claude-github-runner/config.yaml
+#   3. ~/.config/claude-github-runner/config.yml
+#   4. ./config.yml (current directory)
+#
+# You can also specify a custom path with: claude-github-runner --config /path/to/config.yml
+#
+# Copy this example to one of the above locations and customize for your needs.
+#
+# ============================================================================
 
-# Repositories to monitor (required)
+# ----------------------------------------------------------------------------
+# REPOSITORIES (required)
+# ----------------------------------------------------------------------------
+# List of GitHub repositories to monitor for issues and mentions.
+# Format: "owner/repository-name"
+#
+# The runner will only process issues from repositories listed here.
+# This is a security boundary - unlisted repos are never processed.
+#
+# You must have push access to these repositories for the runner to:
+#   - Add/remove labels
+#   - Assign issues
+#   - Create branches
+#   - Create pull requests
+#
+# Requires: GitHub CLI (gh) authenticated with access to these repositories.
 repos:
   - "owner/repo1"
   - "owner/repo2"
 
-# Label configuration
+# ----------------------------------------------------------------------------
+# LABEL CONFIGURATION
+# ----------------------------------------------------------------------------
+# Labels control the workflow state machine. Customize these to match
+# your existing label conventions. All labels are created automatically
+# if they don't exist on the first use.
+#
+# Workflow: ready -> in_progress -> (done | needs_human)
+#
 labels:
-  ready: "ready"              # Issues with this label are picked up
-  in_progress: "in-progress"  # Added when work starts
-  blocked:                    # Issues with these labels are skipped
+  # Ready label (required for queue trigger)
+  # Issues with this label AND no assignee are picked up for processing.
+  # Removed when work starts. Re-add to retry a failed run.
+  # Default: "ready"
+  ready: "ready"
+
+  # In-progress label
+  # Added when the runner claims an issue and starts working.
+  # Removed on completion (success or failure).
+  # Prevents duplicate processing of the same issue.
+  # Default: "in-progress"
+  in_progress: "in-progress"
+
+  # Blocked labels (list)
+  # Issues with ANY of these labels are skipped, even if they have the ready label.
+  # Use for issues that need human input before automation can proceed.
+  # Default: ["blocked", "needs-info"]
+  blocked:
     - "blocked"
     - "needs-info"
-  needs_human: "needs-human"  # Added when human intervention needed
-  done: "done"                # Optionally added on completion
 
-# Branch settings
+  # Needs-human label
+  # Added when the runner cannot complete a task and needs human intervention.
+  # Situations that trigger this:
+  #   - Claude made no code changes
+  #   - Merge conflicts detected
+  #   - Unrecoverable errors
+  # The issue is unassigned and ready for human review.
+  # Default: "needs-human"
+  needs_human: "needs-human"
+
+  # Done label (optional)
+  # Can be added on successful completion. Currently not auto-added.
+  # Useful for tracking which issues were completed by automation.
+  # Default: "done"
+  done: "done"
+
+# ----------------------------------------------------------------------------
+# BRANCH SETTINGS
+# ----------------------------------------------------------------------------
+# Controls how feature branches are created for each issue.
+#
 branching:
-  base_branch: "main"         # Default branch to base work on
-  branch_prefix: "claude"     # Prefix for created branches
+  # Base branch for new work
+  # The branch from which feature branches are created.
+  # If set to "main", the runner auto-detects the repo's default branch
+  # (which may be "master" or something else).
+  # Default: "main" (auto-detect)
+  base_branch: "main"
 
-# Polling settings
+  # Branch name prefix
+  # Feature branches are named: {prefix}/{issue-number}-{slug}
+  # Example: claude/123-fix-login-bug
+  # Keep it short to avoid hitting git's branch name limits.
+  # Default: "claude"
+  branch_prefix: "claude"
+
+# ----------------------------------------------------------------------------
+# POLLING SETTINGS
+# ----------------------------------------------------------------------------
+# Controls how often the runner checks for work and how many parallel
+# jobs can run simultaneously.
+#
 polling:
-  interval_seconds: 300       # How often to check (used by systemd timer)
-  max_concurrency: 1          # Max concurrent runs (1-3)
+  # Polling interval (seconds)
+  # How often the `tick` command checks for new ready issues and mentions.
+  # Used by systemd timer or cron job.
+  # Lower = more responsive, but more API calls.
+  # Recommended: 60-600 seconds (1-10 minutes)
+  # Default: 300 (5 minutes)
+  interval_seconds: 300
 
-# Timeout settings
+  # Maximum concurrent runs
+  # How many issues can be processed simultaneously.
+  # Higher values process the queue faster but use more resources.
+  # Each run spawns a Claude Code process which can be CPU/memory intensive.
+  # Valid range: 1-3 (capped at 3 during testing phase)
+  # Default: 1
+  max_concurrency: 1
+
+# ----------------------------------------------------------------------------
+# TIMEOUT SETTINGS
+# ----------------------------------------------------------------------------
+# Controls how long runs are allowed to execute before being terminated
+# or marked as stale.
+#
 timeouts:
-  run_timeout_minutes: 60     # Max time for a single run
-  stale_run_minutes: 180      # Mark runs stale after this time
+  # Run timeout (minutes)
+  # Maximum time Claude Code is allowed to run on a single issue.
+  # After this time, the Claude process is killed.
+  # Set based on expected issue complexity. Larger repos may need more time.
+  # Default: 60 (1 hour)
+  run_timeout_minutes: 60
 
-# Path settings
+  # Stale run threshold (minutes)
+  # Runs older than this are considered stale during the `reap` command.
+  # Stale runs are terminated and marked as failed.
+  # Should be longer than run_timeout_minutes to allow for cleanup.
+  # Default: 180 (3 hours)
+  stale_run_minutes: 180
+
+# ----------------------------------------------------------------------------
+# PATH SETTINGS
+# ----------------------------------------------------------------------------
+# File system paths for workspaces and state storage.
+# Ensure the user running the service has read/write access to these paths.
+#
 paths:
+  # Workspace root directory
+  # Each run creates a subdirectory here with the run ID.
+  # Structure: {workspace_root}/{run-id}/
+  #   ├── repo/           # Git clone of the repository
+  #   ├── artifacts/      # Logs and outputs
+  #   │   ├── runner.log  # Command execution log
+  #   │   ├── claude.log  # Claude Code output
+  #   │   ├── git.diff    # Changes made
+  #   │   └── summary.json
+  #   └── prompt.md       # Task prompt sent to Claude
+  #
+  # Ensure sufficient disk space for clones and artifacts.
+  # Default: "/home/claude/workspace/_runs"
   workspace_root: "/home/claude/workspace/_runs"
+
+  # SQLite database path
+  # Stores run history, state, and processed comment IDs.
+  # Created automatically if it doesn't exist.
+  # Back this up if you want to preserve run history.
+  # Default: "/home/claude/workspace/runner.sqlite"
   db_path: "/home/claude/workspace/runner.sqlite"
 
-# Claude Code settings
+# ----------------------------------------------------------------------------
+# CLAUDE CODE SETTINGS
+# ----------------------------------------------------------------------------
+# Configuration for invoking Claude Code CLI.
+#
+# SECURITY WARNING: The default configuration runs Claude with elevated
+# permissions suitable for headless automation. Review the security
+# implications before deploying.
+#
 claude:
-  command: "claude"           # Path to claude CLI
+  # Path to Claude Code CLI
+  # Use full path if not in system PATH.
+  # Default: "claude"
+  command: "claude"
+
+  # Non-interactive arguments
+  # Arguments passed to Claude Code for headless execution.
+  #
+  # --dangerously-skip-permissions: SECURITY SENSITIVE
+  #   Bypasses all tool permission prompts. Required for unattended operation
+  #   since there's no human to approve actions.
+  #   This allows Claude to:
+  #     - Read/write any file in the workspace
+  #     - Execute shell commands
+  #     - Make network requests
+  #     - Install packages
+  #
+  #   Mitigations in place:
+  #     - Each run operates in an isolated workspace
+  #     - Git operations are scoped to the cloned repo
+  #     - GitHub operations require authenticated gh CLI
+  #
+  #   Consider:
+  #     - Running on an isolated VPS/container
+  #     - Using a dedicated GitHub user with limited repo access
+  #     - Network-level isolation if processing untrusted issues
+  #
+  # Default: ["--dangerously-skip-permissions"]
   non_interactive_args:
     - "--dangerously-skip-permissions"
 
-# Priority settings
+# ----------------------------------------------------------------------------
+# PRIORITY SETTINGS
+# ----------------------------------------------------------------------------
+# Controls the order in which jobs are processed when multiple are queued.
+#
 priorities:
-  mention_first: true         # Process mentions before ready issues
-  oldest_first: true          # Process oldest items first
+  # Process mentions before ready issues
+  # When true: @mentions are processed before issues in the ready queue.
+  # Mentions typically indicate someone is waiting for a response.
+  # Default: true
+  mention_first: true
 
-# Cleanup settings
+  # Process oldest items first (FIFO)
+  # When true: older items are processed before newer ones.
+  # When false: newer items are processed first (LIFO).
+  # FIFO is usually fairer but LIFO may be better if you want
+  # the most recent request handled first.
+  # Default: true
+  oldest_first: true
+
+# ----------------------------------------------------------------------------
+# CLEANUP SETTINGS
+# ----------------------------------------------------------------------------
+# Controls workspace cleanup after runs complete.
+# Workspaces can be large (full repo clones), so cleanup is important.
+#
 cleanup:
-  on_success: "delete"        # delete | keep | archive
-  on_failure: "keep"          # delete | keep | archive
-  keep_hours: 24              # How long to keep failed workspaces
+  # Cleanup action on success
+  # What to do with the workspace after a successful run.
+  # Values:
+  #   - "delete": Remove the workspace directory entirely
+  #   - "keep": Keep the workspace (useful for debugging)
+  #   - "archive": Compress and keep (not yet implemented)
+  # Default: "delete"
+  on_success: "delete"
+
+  # Cleanup action on failure
+  # What to do with the workspace after a failed run.
+  # Keeping failed workspaces helps with debugging.
+  # Values: same as on_success
+  # Default: "keep"
+  on_failure: "keep"
+
+  # Retention period for kept workspaces (hours)
+  # How long to keep workspaces before the `reap` command removes them.
+  # Only applies to workspaces with "keep" cleanup action.
+  # Set to 0 to keep indefinitely (manual cleanup required).
+  # Default: 24
+  keep_hours: 24
+
+# ----------------------------------------------------------------------------
+# RETRY SETTINGS
+# ----------------------------------------------------------------------------
+# Controls retry behavior for transient failures, particularly
+# authentication errors that may resolve themselves.
+#
+# Note: This section is optional and uses sensible defaults.
+#
+retry:
+  # Maximum retry attempts
+  # Number of times to retry on recoverable errors (e.g., auth token expiry).
+  # Total attempts = 1 (initial) + max_retries
+  # Default: 1
+  max_retries: 1
+
+  # Initial delay before first retry (seconds)
+  # Gives time for transient issues to resolve.
+  # Default: 5
+  initial_delay_seconds: 5
+
+  # Backoff multiplier
+  # Each subsequent retry waits longer: delay * (multiplier ^ retry_number)
+  # Example with multiplier=2.0 and initial_delay=5:
+  #   Retry 1: 5 seconds
+  #   Retry 2: 10 seconds
+  #   Retry 3: 20 seconds
+  # Default: 2.0
+  backoff_multiplier: 2.0
+
+# ============================================================================
+# COMMON CONFIGURATIONS
+# ============================================================================
+#
+# Below are example configurations for common deployment scenarios.
+# Uncomment and modify as needed.
+#
+# ----------------------------------------------------------------------------
+# Example: Conservative/Careful setup
+# ----------------------------------------------------------------------------
+# Lower concurrency, longer timeouts, keep all workspaces for review.
+#
+# polling:
+#   interval_seconds: 600  # Check every 10 minutes
+#   max_concurrency: 1     # One at a time
+# timeouts:
+#   run_timeout_minutes: 120  # 2 hours for complex issues
+# cleanup:
+#   on_success: "keep"     # Review all runs before cleanup
+#   on_failure: "keep"
+#   keep_hours: 168        # Keep for 1 week
+#
+# ----------------------------------------------------------------------------
+# Example: High-throughput setup
+# ----------------------------------------------------------------------------
+# Process more issues faster, clean up aggressively.
+#
+# polling:
+#   interval_seconds: 60   # Check every minute
+#   max_concurrency: 3     # Max parallel runs
+# timeouts:
+#   run_timeout_minutes: 30  # Shorter timeout for simpler issues
+# cleanup:
+#   on_success: "delete"   # Clean up immediately
+#   on_failure: "keep"
+#   keep_hours: 6          # Short retention for failures
+#
+# ----------------------------------------------------------------------------
+# Example: Custom label scheme
+# ----------------------------------------------------------------------------
+# Using different label names to match existing workflow.
+#
+# labels:
+#   ready: "claude-ready"
+#   in_progress: "claude-working"
+#   blocked:
+#     - "on-hold"
+#     - "waiting-for-info"
+#     - "do-not-automate"
+#   needs_human: "needs-review"
+#   done: "automated-complete"
