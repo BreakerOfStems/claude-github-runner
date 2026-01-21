@@ -431,51 +431,95 @@ class GitHub:
 
         return comments
 
-    def add_label(self, repo: str, number: int, label: str):
-        """Add a label to an issue or PR."""
-        self._run_gh([
-            "api",
-            "-X", "POST",
-            f"repos/{repo}/issues/{number}/labels",
-            "-f", f"labels[]={label}",
-        ])
+    def add_label(self, repo: str, number: int, label: str) -> bool:
+        """Add a label to an issue or PR.
 
-    def remove_label(self, repo: str, number: int, label: str):
-        """Remove a label from an issue or PR."""
+        Returns True if successful, False otherwise.
+        """
+        try:
+            self._run_gh([
+                "api",
+                "-X", "POST",
+                f"repos/{repo}/issues/{number}/labels",
+                "-f", f"labels[]={label}",
+            ])
+            return True
+        except GitHubError as e:
+            logger.warning(f"Failed to add label '{label}' to {repo}#{number}: {e}")
+            return False
+
+    def remove_label(self, repo: str, number: int, label: str) -> bool:
+        """Remove a label from an issue or PR.
+
+        Returns True if successful (or label didn't exist), False on error.
+        """
         # URL encode the label name for the path
         encoded_label = label.replace(" ", "%20")
-        self._run_gh([
+        result = self._run_gh([
             "api",
             "-X", "DELETE",
             f"repos/{repo}/issues/{number}/labels/{encoded_label}",
         ], check=False)  # Don't fail if label doesn't exist
 
-    def assign_issue(self, repo: str, number: int, assignee: str):
-        """Assign a user to an issue or PR."""
-        self._run_gh([
-            "api",
-            "-X", "POST",
-            f"repos/{repo}/issues/{number}/assignees",
-            "-f", f"assignees[]={assignee}",
-        ])
+        if result.returncode != 0:
+            # 404 is expected if label doesn't exist - treat as success
+            if "404" in result.stderr or "Not Found" in result.stderr:
+                logger.debug(f"Label '{label}' not found on {repo}#{number} (already removed)")
+                return True
+            logger.warning(f"Failed to remove label '{label}' from {repo}#{number}: {result.stderr}")
+            return False
+        return True
 
-    def unassign_issue(self, repo: str, number: int, assignee: str):
-        """Remove a user from an issue or PR."""
-        self._run_gh([
+    def assign_issue(self, repo: str, number: int, assignee: str) -> bool:
+        """Assign a user to an issue or PR.
+
+        Returns True if successful, False otherwise.
+        """
+        try:
+            self._run_gh([
+                "api",
+                "-X", "POST",
+                f"repos/{repo}/issues/{number}/assignees",
+                "-f", f"assignees[]={assignee}",
+            ])
+            return True
+        except GitHubError as e:
+            logger.warning(f"Failed to assign '{assignee}' to {repo}#{number}: {e}")
+            return False
+
+    def unassign_issue(self, repo: str, number: int, assignee: str) -> bool:
+        """Remove a user from an issue or PR.
+
+        Returns True if successful, False otherwise.
+        """
+        result = self._run_gh([
             "api",
             "-X", "DELETE",
             f"repos/{repo}/issues/{number}/assignees",
             "-f", f"assignees[]={assignee}",
         ], check=False)
 
-    def create_comment(self, repo: str, number: int, body: str):
-        """Create a comment on an issue or PR."""
-        self._run_gh([
-            "api",
-            "-X", "POST",
-            f"repos/{repo}/issues/{number}/comments",
-            "-f", f"body={body}",
-        ])
+        if result.returncode != 0:
+            logger.warning(f"Failed to unassign '{assignee}' from {repo}#{number}: {result.stderr}")
+            return False
+        return True
+
+    def create_comment(self, repo: str, number: int, body: str) -> bool:
+        """Create a comment on an issue or PR.
+
+        Returns True if successful, False otherwise.
+        """
+        try:
+            self._run_gh([
+                "api",
+                "-X", "POST",
+                f"repos/{repo}/issues/{number}/comments",
+                "-f", f"body={body}",
+            ])
+            return True
+        except GitHubError as e:
+            logger.warning(f"Failed to create comment on {repo}#{number}: {e}")
+            return False
 
     def clone_repo(self, repo: str, target_dir: str):
         """Clone a repository."""
@@ -565,6 +609,80 @@ class GitHub:
 
         self._run_gh(args)
 
-    def add_pr_comment(self, repo: str, number: int, body: str):
+    def add_pr_comment(self, repo: str, number: int, body: str) -> bool:
         """Add a comment to a PR."""
-        self.create_comment(repo, number, body)
+        return self.create_comment(repo, number, body)
+
+    def get_issue_labels(self, repo: str, number: int) -> list[str]:
+        """Get current labels on an issue or PR.
+
+        Returns list of label names, or empty list on error.
+        """
+        result = self._run_gh([
+            "api",
+            f"repos/{repo}/issues/{number}/labels",
+            "--jq", ".[].name",
+        ], check=False)
+
+        if result.returncode != 0:
+            logger.warning(f"Failed to get labels for {repo}#{number}: {result.stderr}")
+            return []
+
+        if not result.stdout.strip():
+            return []
+
+        return [label.strip() for label in result.stdout.strip().split("\n") if label.strip()]
+
+    def reconcile_labels(
+        self,
+        repo: str,
+        number: int,
+        expected_labels: list[str],
+        unexpected_labels: list[str],
+        max_retries: int = 2,
+    ) -> bool:
+        """Verify and fix label state on an issue/PR.
+
+        Ensures expected_labels are present and unexpected_labels are removed.
+        This is useful for critical state transitions where label consistency matters.
+
+        Returns True if labels are in expected state (or were successfully fixed),
+        False if reconciliation failed after retries.
+        """
+        for attempt in range(max_retries + 1):
+            current_labels = self.get_issue_labels(repo, number)
+
+            if not current_labels and attempt == 0:
+                # Couldn't fetch labels, but don't fail on first attempt
+                logger.warning(f"Could not verify labels on {repo}#{number}, will retry")
+                continue
+
+            # Check what's missing or extra
+            missing_expected = [l for l in expected_labels if l not in current_labels]
+            present_unexpected = [l for l in unexpected_labels if l in current_labels]
+
+            if not missing_expected and not present_unexpected:
+                if attempt > 0:
+                    logger.info(f"Labels reconciled on {repo}#{number} after {attempt} retries")
+                return True
+
+            if attempt == max_retries:
+                logger.error(
+                    f"Failed to reconcile labels on {repo}#{number} after {max_retries} retries. "
+                    f"Missing: {missing_expected}, Unexpected: {present_unexpected}"
+                )
+                return False
+
+            # Try to fix
+            logger.warning(
+                f"Label mismatch on {repo}#{number} (attempt {attempt + 1}): "
+                f"missing={missing_expected}, unexpected={present_unexpected}"
+            )
+
+            for label in missing_expected:
+                self.add_label(repo, number, label)
+
+            for label in present_unexpected:
+                self.remove_label(repo, number, label)
+
+        return False
