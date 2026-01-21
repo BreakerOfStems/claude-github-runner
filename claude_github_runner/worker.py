@@ -268,16 +268,35 @@ class Worker:
         # Cleanup
         self.workspace_manager.cleanup(run_id, success=True)
 
-    def _claim_on_github(self, job: Job, run_id: str):
-        """Claim the issue/PR on GitHub and post starting comment."""
+    def _claim_on_github(self, job: Job, run_id: str) -> bool:
+        """Claim the issue/PR on GitHub and post starting comment.
+
+        Returns True if claim was successful, False if critical operations failed.
+        """
         try:
             # Remove ready label and add in-progress
-            self.github.remove_label(job.repo, job.target_number, self.config.labels.ready)
-            self.github.add_label(job.repo, job.target_number, self.config.labels.in_progress)
+            remove_ok = self.github.remove_label(job.repo, job.target_number, self.config.labels.ready)
+            add_ok = self.github.add_label(job.repo, job.target_number, self.config.labels.in_progress)
+
+            # Reconcile labels if initial operations had issues
+            if not remove_ok or not add_ok:
+                logger.warning("Label operations had issues, running reconciliation")
+                reconciled = self.github.reconcile_labels(
+                    job.repo,
+                    job.target_number,
+                    expected_labels=[self.config.labels.in_progress],
+                    unexpected_labels=[self.config.labels.ready],
+                )
+                if not reconciled:
+                    logger.error(f"Failed to reconcile labels for {job.repo}#{job.target_number}")
+                    return False
 
             # Assign to self
             login = self.github.get_authenticated_user()
-            self.github.assign_issue(job.repo, job.target_number, login)
+            assign_ok = self.github.assign_issue(job.repo, job.target_number, login)
+            if not assign_ok:
+                logger.warning(f"Failed to assign {login} to {job.repo}#{job.target_number}")
+                # Non-critical - continue anyway
 
             # Post starting comment
             if job.comment:
@@ -296,8 +315,10 @@ class Worker:
                 )
 
             logger.info(f"Claimed {job.repo}#{job.target_number}")
+            return True
         except Exception as e:
             logger.warning(f"Failed to claim on GitHub: {e}")
+            return False
 
     def _build_prompt(self, job: Job) -> str:
         """Build the prompt for Claude Code."""
@@ -524,7 +545,16 @@ class Worker:
         """Handle successful completion."""
         try:
             # Remove in-progress label
-            self.github.remove_label(job.repo, job.target_number, self.config.labels.in_progress)
+            remove_ok = self.github.remove_label(job.repo, job.target_number, self.config.labels.in_progress)
+
+            # Reconcile labels if removal failed
+            if not remove_ok:
+                self.github.reconcile_labels(
+                    job.repo,
+                    job.target_number,
+                    expected_labels=[],
+                    unexpected_labels=[self.config.labels.in_progress, self.config.labels.ready],
+                )
 
             # Optionally add done label
             # self.github.add_label(job.repo, job.target_number, self.config.labels.done)
@@ -543,8 +573,17 @@ class Worker:
         """Handle job failure."""
         try:
             # Remove in-progress, add needs-human
-            self.github.remove_label(job.repo, job.target_number, self.config.labels.in_progress)
-            self.github.add_label(job.repo, job.target_number, self.config.labels.needs_human)
+            remove_ok = self.github.remove_label(job.repo, job.target_number, self.config.labels.in_progress)
+            add_ok = self.github.add_label(job.repo, job.target_number, self.config.labels.needs_human)
+
+            # Reconcile labels if operations had issues - critical to mark as needs-human
+            if not remove_ok or not add_ok:
+                self.github.reconcile_labels(
+                    job.repo,
+                    job.target_number,
+                    expected_labels=[self.config.labels.needs_human],
+                    unexpected_labels=[self.config.labels.in_progress, self.config.labels.ready],
+                )
 
             # Unassign the bot
             login = self.github.get_authenticated_user()
@@ -580,8 +619,17 @@ class Worker:
 
         try:
             # Remove in-progress, add needs-human (ready was already removed at claim time)
-            self.github.remove_label(job.repo, job.target_number, self.config.labels.in_progress)
-            self.github.add_label(job.repo, job.target_number, self.config.labels.needs_human)
+            remove_ok = self.github.remove_label(job.repo, job.target_number, self.config.labels.in_progress)
+            add_ok = self.github.add_label(job.repo, job.target_number, self.config.labels.needs_human)
+
+            # Reconcile labels if operations had issues - critical to mark as needs-human
+            if not remove_ok or not add_ok:
+                self.github.reconcile_labels(
+                    job.repo,
+                    job.target_number,
+                    expected_labels=[self.config.labels.needs_human],
+                    unexpected_labels=[self.config.labels.in_progress, self.config.labels.ready],
+                )
 
             # Unassign the bot
             login = self.github.get_authenticated_user()
@@ -611,8 +659,17 @@ class Worker:
         conflict_files = git.get_conflict_files()
 
         try:
-            # Add needs-human label
-            self.github.add_label(job.repo, job.target_number, self.config.labels.needs_human)
+            # Add needs-human label (in-progress should remain as we're still assigned)
+            add_ok = self.github.add_label(job.repo, job.target_number, self.config.labels.needs_human)
+
+            # Reconcile if add failed
+            if not add_ok:
+                self.github.reconcile_labels(
+                    job.repo,
+                    job.target_number,
+                    expected_labels=[self.config.labels.needs_human, self.config.labels.in_progress],
+                    unexpected_labels=[self.config.labels.ready],
+                )
 
             # Comment
             files_list = "\n".join(f"- `{f}`" for f in conflict_files)
