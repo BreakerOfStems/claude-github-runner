@@ -9,6 +9,7 @@ import sys
 import time
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from .config import Config
@@ -383,7 +384,7 @@ class Daemon:
             cmd.extend(["--config", self.config_path])
 
         # Create workspace directory for logs
-        workspace_root = self.config.paths.workspace_root
+        workspace_root = Path(self.config.paths.workspace_root)
         run_dir = workspace_root / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
         log_file = run_dir / "daemon_spawn.log"
