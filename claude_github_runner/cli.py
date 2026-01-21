@@ -239,6 +239,8 @@ class Runner:
                     "target": r.target_number,
                     "status": r.status.value,
                     "started_at": r.started_at.isoformat() if r.started_at else None,
+                    "error": r.error,
+                    "has_stderr": bool(r.stderr_output),
                 }
                 for r in active_runs
             ],
@@ -594,6 +596,21 @@ def main():
         help="Systemd timer name",
     )
 
+    # logs command
+    logs_parser = subparsers.add_parser(
+        "logs",
+        help="Show logs for a specific run",
+    )
+    logs_parser.add_argument(
+        "run_id",
+        help="Run ID to show logs for",
+    )
+    logs_parser.add_argument(
+        "--stderr",
+        action="store_true",
+        help="Show full stderr output (stored in database)",
+    )
+
     # daemon command
     daemon_parser = subparsers.add_parser(
         "daemon",
@@ -668,6 +685,35 @@ def main():
             result = runner.status()
             import json
             print(json.dumps(result, indent=2))
+
+        elif args.command == "logs":
+            run = runner.db.get_run(args.run_id)
+            if not run:
+                print(f"Run not found: {args.run_id}")
+                sys.exit(1)
+
+            if args.stderr:
+                if run.stderr_output:
+                    print(run.stderr_output)
+                else:
+                    print("No stderr output captured for this run.")
+            else:
+                # Show run summary
+                print(f"Run ID: {run.run_id}")
+                print(f"Repo: {run.repo}")
+                print(f"Target: #{run.target_number}")
+                print(f"Status: {run.status.value}")
+                if run.started_at:
+                    print(f"Started: {run.started_at}")
+                if run.ended_at:
+                    print(f"Ended: {run.ended_at}")
+                if run.error:
+                    print(f"Error: {run.error}")
+                if run.stderr_output:
+                    stderr_size = len(run.stderr_output)
+                    stderr_lines = run.stderr_output.count('\n') + 1
+                    print(f"\nStderr captured: {stderr_size} bytes, {stderr_lines} lines")
+                    print("Use --stderr flag to view full stderr output")
 
     except KeyboardInterrupt:
         logger.info("Interrupted")
