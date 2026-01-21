@@ -273,6 +273,8 @@ cat /home/claude/workspace/_runs/<run-id>/artifacts/claude.log
 
 ### Database Inspection
 
+See [docs/DATABASE.md](docs/DATABASE.md) for full schema documentation.
+
 ```bash
 sqlite3 /home/claude/workspace/runner.sqlite
 
