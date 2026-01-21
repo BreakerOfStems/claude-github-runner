@@ -1,6 +1,8 @@
 """SQLite database layer for Claude GitHub Runner."""
 
+import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -56,8 +58,71 @@ class Cursor:
     last_poll_at: datetime
 
 
+class ConnectionPool:
+    """Thread-local connection pool for SQLite.
+
+    Each thread gets its own connection that is reused across operations.
+    This avoids opening/closing connections for every database operation
+    while maintaining thread safety (SQLite connections should not be shared
+    across threads).
+
+    The pool also tracks the process ID to handle fork() safely - child
+    processes automatically get fresh connections.
+    """
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._local = threading.local()
+        self._pid = os.getpid()
+
+    def get_connection(self) -> sqlite3.Connection:
+        """Get or create a connection for the current thread.
+
+        Returns an existing connection if one exists for this thread,
+        otherwise creates a new one. Also handles process fork by
+        creating new connections in child processes.
+        """
+        # Check if we've forked - child processes need fresh connections
+        current_pid = os.getpid()
+        if current_pid != self._pid:
+            # We're in a forked child process - reset the thread local
+            self._local = threading.local()
+            self._pid = current_pid
+
+        if not hasattr(self._local, 'connection') or self._local.connection is None:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            # Enable WAL mode for better concurrent access
+            conn.execute("PRAGMA journal_mode=WAL")
+            self._local.connection = conn
+
+        return self._local.connection
+
+    def close_connection(self):
+        """Close the connection for the current thread if it exists."""
+        if hasattr(self._local, 'connection') and self._local.connection is not None:
+            try:
+                self._local.connection.close()
+            except Exception:
+                pass
+            self._local.connection = None
+
+    def close_all(self):
+        """Close connection in the current thread.
+
+        Note: This only closes the connection in the calling thread.
+        Thread-local connections in other threads will be closed when
+        those threads exit or call close_connection().
+        """
+        self.close_connection()
+
+
 class Database:
-    """SQLite database manager for the runner."""
+    """SQLite database manager for the runner.
+
+    Uses connection pooling with thread-local storage to efficiently
+    reuse connections while maintaining thread safety.
+    """
 
     SCHEMA = """
     CREATE TABLE IF NOT EXISTS runs (
@@ -99,6 +164,7 @@ class Database:
 
     def __init__(self, db_path: str):
         self.db_path = db_path
+        self._pool = ConnectionPool(db_path)
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
@@ -109,17 +175,29 @@ class Database:
 
     @contextmanager
     def _connect(self):
-        """Context manager for database connections."""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
+        """Context manager for database connections.
+
+        Uses pooled connections - the same connection is reused for
+        multiple operations within the same thread. This significantly
+        reduces overhead when max_concurrency > 1.
+        """
+        conn = self._pool.get_connection()
         try:
             yield conn
             conn.commit()
         except Exception:
             conn.rollback()
             raise
-        finally:
-            conn.close()
+        # Note: We don't close the connection here - it stays in the pool
+        # for reuse by subsequent operations in this thread
+
+    def close(self):
+        """Close the pooled connection for the current thread.
+
+        Call this when done with database operations in the current thread,
+        especially in forked child processes before exiting.
+        """
+        self._pool.close_connection()
 
     # Run operations
     def create_run(self, run: Run) -> bool:
