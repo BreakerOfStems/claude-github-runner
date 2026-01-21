@@ -33,6 +33,7 @@ class PollingConfig:
 class TimeoutsConfig:
     run_timeout_minutes: int = 60
     stale_run_minutes: int = 180
+    github_api_timeout_seconds: int = 30
 
 
 @dataclass
@@ -46,6 +47,14 @@ class RetryConfig:
     max_retries: int = 1  # Number of retry attempts on auth errors
     initial_delay_seconds: int = 5  # Initial delay before first retry
     backoff_multiplier: float = 2.0  # Multiplier for exponential backoff
+
+
+@dataclass
+class CircuitBreakerConfig:
+    failure_threshold: int = 5  # Number of consecutive failures before opening circuit
+    recovery_timeout_seconds: int = 60  # Time to wait before attempting recovery
+    half_open_max_calls: int = 3  # Max calls allowed in half-open state
+    backoff_multiplier: float = 2.0  # Multiplier for exponential backoff on recovery timeout
 
 
 @dataclass
@@ -65,6 +74,7 @@ class CleanupConfig:
     on_success: str = "delete"  # delete | keep | archive
     on_failure: str = "keep"    # delete | keep | archive
     keep_hours: int = 24
+    cleanup_batch_size: int = 100  # Max items to process per cleanup cycle
 
 
 @dataclass
@@ -79,6 +89,7 @@ class Config:
     priorities: PrioritiesConfig = field(default_factory=PrioritiesConfig)
     cleanup: CleanupConfig = field(default_factory=CleanupConfig)
     retry: RetryConfig = field(default_factory=RetryConfig)
+    circuit_breaker: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
     _config_path: Optional[str] = field(default=None, repr=False)  # Track source config path for spawned workers
 
     @classmethod
@@ -118,6 +129,7 @@ class Config:
             config.timeouts = TimeoutsConfig(
                 run_timeout_minutes=timeouts.get("run_timeout_minutes", config.timeouts.run_timeout_minutes),
                 stale_run_minutes=timeouts.get("stale_run_minutes", config.timeouts.stale_run_minutes),
+                github_api_timeout_seconds=timeouts.get("github_api_timeout_seconds", config.timeouts.github_api_timeout_seconds),
             )
 
         if "paths" in data:
@@ -147,6 +159,7 @@ class Config:
                 on_success=cleanup.get("on_success", config.cleanup.on_success),
                 on_failure=cleanup.get("on_failure", config.cleanup.on_failure),
                 keep_hours=cleanup.get("keep_hours", config.cleanup.keep_hours),
+                cleanup_batch_size=cleanup.get("cleanup_batch_size", config.cleanup.cleanup_batch_size),
             )
 
         if "retry" in data:
@@ -155,6 +168,15 @@ class Config:
                 max_retries=retry.get("max_retries", config.retry.max_retries),
                 initial_delay_seconds=retry.get("initial_delay_seconds", config.retry.initial_delay_seconds),
                 backoff_multiplier=retry.get("backoff_multiplier", config.retry.backoff_multiplier),
+            )
+
+        if "circuit_breaker" in data:
+            cb = data["circuit_breaker"]
+            config.circuit_breaker = CircuitBreakerConfig(
+                failure_threshold=cb.get("failure_threshold", config.circuit_breaker.failure_threshold),
+                recovery_timeout_seconds=cb.get("recovery_timeout_seconds", config.circuit_breaker.recovery_timeout_seconds),
+                half_open_max_calls=cb.get("half_open_max_calls", config.circuit_breaker.half_open_max_calls),
+                backoff_multiplier=cb.get("backoff_multiplier", config.circuit_breaker.backoff_multiplier),
             )
 
         return config

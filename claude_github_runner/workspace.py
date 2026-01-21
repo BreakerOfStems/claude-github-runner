@@ -101,21 +101,44 @@ class Workspace:
         except Exception as e:
             logger.error(f"Failed to archive workspace {root}: {e}")
 
-    def cleanup_old_workspaces(self):
-        """Clean up workspaces older than keep_hours."""
+    def cleanup_old_workspaces(self) -> int:
+        """Clean up workspaces older than keep_hours.
+
+        Uses os.scandir() for memory-efficient iteration and processes
+        items in batches to avoid performance issues with large directories.
+
+        Returns:
+            Number of workspaces deleted in this cleanup cycle.
+        """
         if not self.workspace_root.exists():
-            return
+            return 0
 
         cutoff = datetime.utcnow().timestamp() - (self.config.cleanup.keep_hours * 3600)
+        batch_size = self.config.cleanup.cleanup_batch_size
+        deleted_count = 0
 
-        for item in self.workspace_root.iterdir():
-            if item.is_dir():
-                try:
-                    mtime = item.stat().st_mtime
-                    if mtime < cutoff:
-                        self._delete_workspace(item)
-                except Exception as e:
-                    logger.error(f"Error checking workspace {item}: {e}")
+        with os.scandir(self.workspace_root) as entries:
+            for entry in entries:
+                if deleted_count >= batch_size:
+                    logger.info(
+                        f"Reached cleanup batch limit ({batch_size}), "
+                        f"remaining items will be cleaned up in next cycle"
+                    )
+                    break
+
+                if entry.is_dir(follow_symlinks=False):
+                    try:
+                        mtime = entry.stat(follow_symlinks=False).st_mtime
+                        if mtime < cutoff:
+                            self._delete_workspace(Path(entry.path))
+                            deleted_count += 1
+                    except Exception as e:
+                        logger.error(f"Error checking workspace {entry.path}: {e}")
+
+        if deleted_count > 0:
+            logger.info(f"Cleaned up {deleted_count} old workspace(s)")
+
+        return deleted_count
 
 
 class Git:

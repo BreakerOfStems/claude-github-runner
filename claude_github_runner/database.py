@@ -11,7 +11,9 @@ Key design decisions:
 - Enum values stored as lowercase strings matching Python enum values
 """
 
+import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -72,6 +74,7 @@ class Run:
     started_at: Optional[datetime] = None
     ended_at: Optional[datetime] = None
     error: Optional[str] = None
+    stderr_output: Optional[str] = None
 
 
 @dataclass
@@ -101,8 +104,70 @@ class Cursor:
     last_poll_at: datetime
 
 
+class ConnectionPool:
+    """Thread-local connection pool for SQLite.
+
+    Each thread gets its own connection that is reused across operations.
+    This avoids opening/closing connections for every database operation
+    while maintaining thread safety (SQLite connections should not be shared
+    across threads).
+
+    The pool also tracks the process ID to handle fork() safely - child
+    processes automatically get fresh connections.
+    """
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._local = threading.local()
+        self._pid = os.getpid()
+
+    def get_connection(self) -> sqlite3.Connection:
+        """Get or create a connection for the current thread.
+
+        Returns an existing connection if one exists for this thread,
+        otherwise creates a new one. Also handles process fork by
+        creating new connections in child processes.
+        """
+        # Check if we've forked - child processes need fresh connections
+        current_pid = os.getpid()
+        if current_pid != self._pid:
+            # We're in a forked child process - reset the thread local
+            self._local = threading.local()
+            self._pid = current_pid
+
+        if not hasattr(self._local, 'connection') or self._local.connection is None:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            # Enable WAL mode for better concurrent access
+            conn.execute("PRAGMA journal_mode=WAL")
+            self._local.connection = conn
+
+        return self._local.connection
+
+    def close_connection(self):
+        """Close the connection for the current thread if it exists."""
+        if hasattr(self._local, 'connection') and self._local.connection is not None:
+            try:
+                self._local.connection.close()
+            except Exception:
+                pass
+            self._local.connection = None
+
+    def close_all(self):
+        """Close connection in the current thread.
+
+        Note: This only closes the connection in the calling thread.
+        Thread-local connections in other threads will be closed when
+        those threads exit or call close_connection().
+        """
+        self.close_connection()
+
+
 class Database:
     """SQLite database manager for the runner.
+
+    Uses connection pooling with thread-local storage to efficiently
+    reuse connections while maintaining thread safety.
 
     Handles all database operations including schema initialization,
     run management, comment tracking, and cursor updates.
@@ -129,7 +194,8 @@ class Database:
         pr_url TEXT,
         started_at TEXT,
         ended_at TEXT,
-        error TEXT
+        error TEXT,
+        stderr_output TEXT
     );
 
     -- Partial unique index: ensures only one active run per issue/PR.
@@ -166,6 +232,7 @@ class Database:
 
     def __init__(self, db_path: str):
         self.db_path = db_path
+        self._pool = ConnectionPool(db_path)
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
@@ -173,20 +240,41 @@ class Database:
         """Initialize database schema."""
         with self._connect() as conn:
             conn.executescript(self.SCHEMA)
+            self._migrate(conn)
+
+    def _migrate(self, conn):
+        """Run database migrations for schema updates."""
+        # Check if stderr_output column exists
+        cursor = conn.execute("PRAGMA table_info(runs)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "stderr_output" not in columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN stderr_output TEXT")
 
     @contextmanager
     def _connect(self):
-        """Context manager for database connections."""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
+        """Context manager for database connections.
+
+        Uses pooled connections - the same connection is reused for
+        multiple operations within the same thread. This significantly
+        reduces overhead when max_concurrency > 1.
+        """
+        conn = self._pool.get_connection()
         try:
             yield conn
             conn.commit()
         except Exception:
             conn.rollback()
             raise
-        finally:
-            conn.close()
+        # Note: We don't close the connection here - it stays in the pool
+        # for reuse by subsequent operations in this thread
+
+    def close(self):
+        """Close the pooled connection for the current thread.
+
+        Call this when done with database operations in the current thread,
+        especially in forked child processes before exiting.
+        """
+        self._pool.close_connection()
 
     # Run operations
 
@@ -202,8 +290,8 @@ class Database:
             try:
                 conn.execute(
                     """
-                    INSERT INTO runs (run_id, repo, target_number, job_type, status, pid, branch, pr_url, started_at, ended_at, error)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO runs (run_id, repo, target_number, job_type, status, pid, branch, pr_url, started_at, ended_at, error, stderr_output)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         run.run_id,
@@ -217,10 +305,40 @@ class Database:
                         run.started_at.isoformat() if run.started_at else None,
                         run.ended_at.isoformat() if run.ended_at else None,
                         run.error,
+                        run.stderr_output,
                     ),
                 )
                 return True
             except sqlite3.IntegrityError:
+                return False
+
+    def claim_job(self, run_id: str, repo: str, target_number: int, job_type: JobType) -> bool:
+        """Atomically claim a job by creating a run record.
+
+        This is the safe way to claim a job - it uses the database's unique index
+        on (repo, target_number) for active runs to prevent race conditions.
+        Two workers calling this for the same target will have only one succeed.
+
+        Returns True if the job was claimed, False if another run already exists.
+        """
+        with self._connect() as conn:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO runs (run_id, repo, target_number, job_type, status)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        repo,
+                        target_number,
+                        job_type.value,
+                        RunStatus.QUEUED.value,
+                    ),
+                )
+                return True
+            except sqlite3.IntegrityError:
+                # Another run already exists for this target
                 return False
 
     def get_run(self, run_id: str) -> Optional[Run]:
@@ -272,6 +390,7 @@ class Database:
         branch: Optional[str] = None,
         pr_url: Optional[str] = None,
         error: Optional[str] = None,
+        stderr_output: Optional[str] = None,
     ):
         """Update run status and optional fields.
 
@@ -298,6 +417,10 @@ class Database:
             if error is not None:
                 updates.append("error = ?")
                 values.append(error)
+
+            if stderr_output is not None:
+                updates.append("stderr_output = ?")
+                values.append(stderr_output)
 
             if status == RunStatus.RUNNING:
                 updates.append("started_at = ?")
@@ -327,6 +450,7 @@ class Database:
             started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
             ended_at=datetime.fromisoformat(row["ended_at"]) if row["ended_at"] else None,
             error=row["error"],
+            stderr_output=row["stderr_output"] if "stderr_output" in row.keys() else None,
         )
 
     # Processed comments operations
@@ -410,3 +534,39 @@ class Database:
                 (stale_minutes,),
             ).fetchall()
             return [self._row_to_run(row) for row in rows]
+
+    def get_run_by_branch(self, repo: str, branch: str) -> Optional[Run]:
+        """Get a run by repo and branch name, useful for idempotency checks."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM runs
+                WHERE repo = ? AND branch = ?
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+                (repo, branch),
+            ).fetchone()
+            if row:
+                return self._row_to_run(row)
+        return None
+
+    def get_run_with_pr_for_target(self, repo: str, target_number: int) -> Optional[Run]:
+        """Get the most recent run that created a PR for a target.
+
+        Used for idempotency: if a previous run already created a PR,
+        we can detect this and avoid creating duplicates.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM runs
+                WHERE repo = ? AND target_number = ? AND pr_url IS NOT NULL
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+                (repo, target_number),
+            ).fetchone()
+            if row:
+                return self._row_to_run(row)
+        return None

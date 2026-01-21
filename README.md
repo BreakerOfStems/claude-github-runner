@@ -86,6 +86,27 @@ pip install .
 pip install -e ".[dev]"
 ```
 
+### Development Setup
+
+For development, install pre-commit hooks to ensure code quality:
+
+```bash
+# Install dev dependencies (includes pre-commit)
+pip install -e ".[dev]"
+
+# Install the pre-commit hooks
+pre-commit install
+
+# (Optional) Run hooks on all files
+pre-commit run --all-files
+```
+
+The pre-commit hooks will automatically check:
+- **black**: Code formatting
+- **ruff**: Linting and import sorting
+- **mypy**: Type checking
+- Basic file hygiene (trailing whitespace, YAML validation, etc.)
+
 ### Verify Installation
 
 ```bash
