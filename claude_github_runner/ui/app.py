@@ -617,6 +617,22 @@ class RunnerUI(App):
         )
 
 
+def reset_terminal() -> None:
+    """Reset terminal state to clean up any artifacts from mouse tracking.
+
+    This sends escape sequences to disable various terminal modes that may not
+    have been properly disabled on exit, such as:
+    - SGR mouse tracking
+    - Mouse button tracking
+    - Mouse any-event tracking
+    - Ensure cursor is visible
+    - Reset character attributes
+    """
+    import sys
+    sys.stdout.write("\033[?1006l\033[?1003l\033[?1000l\033[?25h\033[0m")
+    sys.stdout.flush()
+
+
 def main(
     db_path: str = "/home/claude/workspace/runner.sqlite",
     workspace_root: str = "/home/claude/workspace/_runs",
@@ -630,4 +646,7 @@ def main(
         service_name=service_name,
         timer_name=timer_name,
     )
-    app.run()
+    try:
+        app.run()
+    finally:
+        reset_terminal()
