@@ -46,7 +46,10 @@ class Runner:
     def __init__(self, config_path: Optional[str] = None):
         self.config = Config.load(config_path)
         self.db = Database(self.config.paths.db_path)
-        self.github = GitHub(self.config.circuit_breaker)
+        self.github = GitHub(
+            circuit_breaker_config=self.config.circuit_breaker,
+            timeout_seconds=self.config.timeouts.github_api_timeout_seconds,
+        )
         self.workspace_manager = Workspace(self.config)
         self.discovery = Discovery(self.config, self.db, self.github)
         self.worker = Worker(self.config, self.db, self.github, self.workspace_manager)
@@ -149,13 +152,31 @@ class Runner:
         return self.worker.execute(job, run_id=run_id)
 
     def reap(self) -> dict:
-        """Detect dead PIDs and mark stale runs."""
+        """Detect dead PIDs and mark stale runs.
+
+        Also attempts to reap any zombie processes that may have accumulated
+        if SIGCHLD handling was not properly configured.
+        """
         logger.info("Starting reap")
 
         results = {
             "dead_pids": [],
             "stale_runs": [],
+            "reaped_zombies": [],
         }
+
+        # First, try to reap any zombie processes (non-blocking)
+        # This handles cases where SIGCHLD handler wasn't installed
+        while True:
+            try:
+                pid, status = os.waitpid(-1, os.WNOHANG)
+                if pid == 0:
+                    break
+                results["reaped_zombies"].append(pid)
+                logger.info(f"Reaped zombie process {pid}")
+            except ChildProcessError:
+                # No children to wait for
+                break
 
         # Check running runs for dead PIDs
         running_runs = self.db.get_running_runs()
@@ -207,7 +228,10 @@ class Runner:
         # Clean up old workspaces
         self.workspace_manager.cleanup_old_workspaces()
 
-        logger.info(f"Reap complete: {len(results['dead_pids'])} dead PIDs, {len(results['stale_runs'])} stale runs")
+        if results["reaped_zombies"]:
+            logger.info(f"Reap complete: {len(results['dead_pids'])} dead PIDs, {len(results['stale_runs'])} stale runs, {len(results['reaped_zombies'])} zombies reaped")
+        else:
+            logger.info(f"Reap complete: {len(results['dead_pids'])} dead PIDs, {len(results['stale_runs'])} stale runs")
         return results
 
     def _get_available_slots(self) -> int:
@@ -270,7 +294,10 @@ class Daemon:
         self.config_path = config_path
         self.config = Config.load(config_path)
         self.db = Database(self.config.paths.db_path)
-        self.github = GitHub(self.config.circuit_breaker)
+        self.github = GitHub(
+            circuit_breaker_config=self.config.circuit_breaker,
+            timeout_seconds=self.config.timeouts.github_api_timeout_seconds,
+        )
         self.workspace_manager = Workspace(self.config)
         self.discovery = Discovery(self.config, self.db, self.github)
 
@@ -346,26 +373,23 @@ class Daemon:
         """Start a job as a subprocess."""
         run_id = f"{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
 
-        logger.info(f"Starting job {job.repo}#{job.target_number} as run {run_id}")
+        logger.info(f"Attempting to claim job {job.repo}#{job.target_number} as run {run_id}")
 
-        # For mention jobs, mark comment as processed first
+        # Atomically claim the job first to prevent race conditions
+        # This must happen BEFORE marking comments processed to avoid orphaned records
+        if not self.db.claim_job(run_id, job.repo, job.target_number, job.job_type):
+            logger.info(f"Job {job.repo}#{job.target_number} already claimed by another run, skipping")
+            return
+
+        logger.info(f"Successfully claimed job {job.repo}#{job.target_number}")
+
+        # For mention jobs, mark comment as processed after claiming
         if job.comment:
             if not self.discovery.mark_comment_processed(job, run_id):
                 logger.info(f"Comment {job.comment.id} already processed, skipping")
+                # Note: we've already claimed the job, but this is fine - the run will
+                # complete quickly since there's nothing to do
                 return
-
-        # Create run record in DB
-        run = Run(
-            run_id=run_id,
-            repo=job.repo,
-            target_number=job.target_number,
-            job_type=job.job_type,
-            status=RunStatus.QUEUED,
-        )
-
-        if not self.db.create_run(run):
-            logger.error(f"Failed to create run: active run exists for {job.repo}#{job.target_number}")
-            return
 
         # Build the cgr run command
         cmd = [

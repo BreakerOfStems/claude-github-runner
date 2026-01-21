@@ -86,7 +86,10 @@ class Discovery:
         )
 
         for issue in issues:
-            # Skip if there's an active run for this target
+            # Skip if there's an active run for this target.
+            # Note: This is an optimization to avoid unnecessary claim attempts.
+            # The actual protection against race conditions is in db.claim_job(),
+            # which uses the database's unique index to atomically claim jobs.
             if self.db.get_active_run_for_target(repo, issue.number):
                 logger.debug(f"Skipping {repo}#{issue.number}: active run exists")
                 continue
@@ -155,7 +158,10 @@ class Discovery:
             if self.db.is_comment_processed(comment.id):
                 continue
 
-            # Skip if there's an active run for this target
+            # Skip if there's an active run for this target.
+            # Note: This is an optimization to avoid unnecessary claim attempts.
+            # The actual protection against race conditions is in db.claim_job(),
+            # which uses the database's unique index to atomically claim jobs.
             if self.db.get_active_run_for_target(repo, number):
                 logger.debug(f"Skipping mention on {repo}#{number}: active run exists")
                 continue

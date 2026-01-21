@@ -198,8 +198,15 @@ class GitHub:
     _circuit_breaker: Optional[CircuitBreaker] = None
     _circuit_breaker_config: Optional[CircuitBreakerConfig] = None
 
-    def __init__(self, circuit_breaker_config: Optional[CircuitBreakerConfig] = None):
+    DEFAULT_TIMEOUT_SECONDS = 30
+
+    def __init__(
+        self,
+        circuit_breaker_config: Optional[CircuitBreakerConfig] = None,
+        timeout_seconds: Optional[int] = None,
+    ):
         self._login: Optional[str] = None
+        self._timeout = timeout_seconds if timeout_seconds is not None else self.DEFAULT_TIMEOUT_SECONDS
         # Initialize or update circuit breaker if config provided
         if circuit_breaker_config is not None:
             if GitHub._circuit_breaker is None or GitHub._circuit_breaker_config != circuit_breaker_config:
@@ -242,8 +249,12 @@ class GitHub:
                     capture_output=True,
                     text=True,
                     check=check,
+                    timeout=self._timeout,
                 )
                 return result
+            except subprocess.TimeoutExpired as e:
+                logger.error(f"gh command timed out after {self._timeout}s: {' '.join(cmd)}")
+                raise GitHubError(f"gh command timed out after {self._timeout}s") from e
             except subprocess.CalledProcessError as e:
                 logger.error(f"gh command failed: {e.stderr}")
                 raise GitHubError(f"gh command failed: {e.stderr}") from e
@@ -494,12 +505,16 @@ class GitHub:
         ]
 
         def execute_pr_create() -> str:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                cwd=working_dir,
-            )
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    cwd=working_dir,
+                    timeout=self._timeout,
+                )
+            except subprocess.TimeoutExpired:
+                raise GitHubError(f"PR creation timed out after {self._timeout}s")
             if result.returncode != 0:
                 raise GitHubError(f"Failed to create PR: {result.stderr}")
             return result.stdout.strip()
