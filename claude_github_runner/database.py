@@ -149,6 +149,35 @@ class Database:
             except sqlite3.IntegrityError:
                 return False
 
+    def claim_job(self, run_id: str, repo: str, target_number: int, job_type: JobType) -> bool:
+        """Atomically claim a job by creating a run record.
+
+        This is the safe way to claim a job - it uses the database's unique index
+        on (repo, target_number) for active runs to prevent race conditions.
+        Two workers calling this for the same target will have only one succeed.
+
+        Returns True if the job was claimed, False if another run already exists.
+        """
+        with self._connect() as conn:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO runs (run_id, repo, target_number, job_type, status)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        repo,
+                        target_number,
+                        job_type.value,
+                        RunStatus.QUEUED.value,
+                    ),
+                )
+                return True
+            except sqlite3.IntegrityError:
+                # Another run already exists for this target
+                return False
+
     def get_run(self, run_id: str) -> Optional[Run]:
         """Get a run by ID."""
         with self._connect() as conn:

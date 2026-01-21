@@ -41,28 +41,23 @@ class Worker:
     def execute(self, job: Job, comment_id: Optional[int] = None, run_id: Optional[str] = None) -> str:
         """Execute a job. Returns the run_id.
 
-        If run_id is provided, uses the existing run record (created by tick before spawning).
-        Otherwise creates a new run record (for manual runs).
+        If run_id is provided, uses the existing run record (created by tick/daemon before spawning).
+        Otherwise atomically claims the job by creating a new run record (for manual runs).
         """
         if run_id:
-            # Using existing run record created by tick()
+            # Using existing run record created by tick()/daemon
             logger.info(f"Using existing run {run_id} for {job.repo}#{job.target_number} ({job.job_type.value})")
         else:
-            # Manual run - create new run record
+            # Manual run - atomically claim the job
             run_id = f"{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
-            logger.info(f"Starting run {run_id} for {job.repo}#{job.target_number} ({job.job_type.value})")
+            logger.info(f"Attempting to claim job {job.repo}#{job.target_number} as run {run_id}")
 
-            run = Run(
-                run_id=run_id,
-                repo=job.repo,
-                target_number=job.target_number,
-                job_type=job.job_type,
-                status=RunStatus.QUEUED,
-            )
-
-            if not self.db.create_run(run):
-                logger.error(f"Failed to create run: active run exists for {job.repo}#{job.target_number}")
+            # Use atomic claim_job to prevent race conditions
+            if not self.db.claim_job(run_id, job.repo, job.target_number, job.job_type):
+                logger.warning(f"Failed to claim job: another run already active for {job.repo}#{job.target_number}")
                 raise RuntimeError("Active run exists for target")
+
+            logger.info(f"Successfully claimed job {job.repo}#{job.target_number} ({job.job_type.value})")
 
         # Create workspace
         paths = self.workspace_manager.create(run_id)
@@ -82,20 +77,14 @@ class Worker:
         """Execute a job in a background process. Returns the run_id immediately."""
         run_id = f"{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
 
-        logger.info(f"Starting async run {run_id} for {job.repo}#{job.target_number} ({job.job_type.value})")
+        logger.info(f"Attempting to claim job {job.repo}#{job.target_number} for async run {run_id}")
 
-        # Create run record
-        run = Run(
-            run_id=run_id,
-            repo=job.repo,
-            target_number=job.target_number,
-            job_type=job.job_type,
-            status=RunStatus.QUEUED,
-        )
-
-        if not self.db.create_run(run):
-            logger.error(f"Failed to create run: active run exists for {job.repo}#{job.target_number}")
+        # Atomically claim the job to prevent race conditions
+        if not self.db.claim_job(run_id, job.repo, job.target_number, job.job_type):
+            logger.warning(f"Failed to claim job: another run already active for {job.repo}#{job.target_number}")
             raise RuntimeError("Active run exists for target")
+
+        logger.info(f"Successfully claimed job {job.repo}#{job.target_number} ({job.job_type.value})")
 
         # Create workspace before forking
         paths = self.workspace_manager.create(run_id)

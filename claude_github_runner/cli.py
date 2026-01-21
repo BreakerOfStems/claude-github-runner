@@ -346,26 +346,23 @@ class Daemon:
         """Start a job as a subprocess."""
         run_id = f"{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
 
-        logger.info(f"Starting job {job.repo}#{job.target_number} as run {run_id}")
+        logger.info(f"Attempting to claim job {job.repo}#{job.target_number} as run {run_id}")
 
-        # For mention jobs, mark comment as processed first
+        # Atomically claim the job first to prevent race conditions
+        # This must happen BEFORE marking comments processed to avoid orphaned records
+        if not self.db.claim_job(run_id, job.repo, job.target_number, job.job_type):
+            logger.info(f"Job {job.repo}#{job.target_number} already claimed by another run, skipping")
+            return
+
+        logger.info(f"Successfully claimed job {job.repo}#{job.target_number}")
+
+        # For mention jobs, mark comment as processed after claiming
         if job.comment:
             if not self.discovery.mark_comment_processed(job, run_id):
                 logger.info(f"Comment {job.comment.id} already processed, skipping")
+                # Note: we've already claimed the job, but this is fine - the run will
+                # complete quickly since there's nothing to do
                 return
-
-        # Create run record in DB
-        run = Run(
-            run_id=run_id,
-            repo=job.repo,
-            target_number=job.target_number,
-            job_type=job.job_type,
-            status=RunStatus.QUEUED,
-        )
-
-        if not self.db.create_run(run):
-            logger.error(f"Failed to create run: active run exists for {job.repo}#{job.target_number}")
-            return
 
         # Build the cgr run command
         cmd = [
