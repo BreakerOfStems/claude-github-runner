@@ -39,6 +39,7 @@ class Run:
     started_at: Optional[datetime] = None
     ended_at: Optional[datetime] = None
     error: Optional[str] = None
+    stderr_output: Optional[str] = None
 
 
 @dataclass
@@ -136,7 +137,8 @@ class Database:
         pr_url TEXT,
         started_at TEXT,
         ended_at TEXT,
-        error TEXT
+        error TEXT,
+        stderr_output TEXT
     );
 
     CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_active_target
@@ -172,6 +174,15 @@ class Database:
         """Initialize database schema."""
         with self._connect() as conn:
             conn.executescript(self.SCHEMA)
+            self._migrate(conn)
+
+    def _migrate(self, conn):
+        """Run database migrations for schema updates."""
+        # Check if stderr_output column exists
+        cursor = conn.execute("PRAGMA table_info(runs)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "stderr_output" not in columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN stderr_output TEXT")
 
     @contextmanager
     def _connect(self):
@@ -206,8 +217,8 @@ class Database:
             try:
                 conn.execute(
                     """
-                    INSERT INTO runs (run_id, repo, target_number, job_type, status, pid, branch, pr_url, started_at, ended_at, error)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO runs (run_id, repo, target_number, job_type, status, pid, branch, pr_url, started_at, ended_at, error, stderr_output)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         run.run_id,
@@ -221,6 +232,7 @@ class Database:
                         run.started_at.isoformat() if run.started_at else None,
                         run.ended_at.isoformat() if run.ended_at else None,
                         run.error,
+                        run.stderr_output,
                     ),
                 )
                 return True
@@ -305,6 +317,7 @@ class Database:
         branch: Optional[str] = None,
         pr_url: Optional[str] = None,
         error: Optional[str] = None,
+        stderr_output: Optional[str] = None,
     ):
         """Update run status and optional fields."""
         with self._connect() as conn:
@@ -326,6 +339,10 @@ class Database:
             if error is not None:
                 updates.append("error = ?")
                 values.append(error)
+
+            if stderr_output is not None:
+                updates.append("stderr_output = ?")
+                values.append(stderr_output)
 
             if status == RunStatus.RUNNING:
                 updates.append("started_at = ?")
@@ -355,6 +372,7 @@ class Database:
             started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
             ended_at=datetime.fromisoformat(row["ended_at"]) if row["ended_at"] else None,
             error=row["error"],
+            stderr_output=row["stderr_output"] if "stderr_output" in row.keys() else None,
         )
 
     # Processed comments operations

@@ -21,6 +21,9 @@ from .workspace import Workspace, WorkspacePaths, Git
 
 logger = logging.getLogger(__name__)
 
+# Maximum size for stderr capture (100KB as specified in issue #29)
+MAX_STDERR_SIZE = 100 * 1024
+
 # Track child PIDs for proper cleanup
 _child_pids: Set[int] = set()
 _original_sigchld_handler = None
@@ -559,11 +562,21 @@ class Worker:
 
         if returncode != 0:
             logger.warning(f"Claude exited with code {returncode}")
-            # Log stderr for debugging
+            # Capture full stderr for storage (with size limit)
             stderr_content = stderr_path.read_text().strip()
             if stderr_content:
-                for line in stderr_content.split('\n')[:10]:
+                # Log truncated version to console
+                stderr_lines = stderr_content.split('\n')
+                for line in stderr_lines[:10]:
                     logger.warning(f"Claude stderr: {line}")
+                if len(stderr_lines) > 10:
+                    logger.warning(f"Claude stderr: ... ({len(stderr_lines) - 10} more lines, see full output via 'cgr logs {run_id} --stderr')")
+
+                # Store full stderr in database (truncated to MAX_STDERR_SIZE)
+                full_stderr = stderr_content[:MAX_STDERR_SIZE]
+                if len(stderr_content) > MAX_STDERR_SIZE:
+                    full_stderr += f"\n\n... (truncated, {len(stderr_content) - MAX_STDERR_SIZE} bytes omitted)"
+                self.db.update_run_status(run_id, RunStatus.RUNNING, stderr_output=full_stderr)
             # Don't raise - Claude might have made partial progress
 
     def _build_commit_message(self, job: Job) -> str:
