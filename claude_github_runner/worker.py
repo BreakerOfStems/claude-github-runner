@@ -185,7 +185,10 @@ class Worker:
 
                 # Reconnect to database (connection isn't safe to share across fork)
                 self.db = Database(self.config.paths.db_path)
-                self.github = GitHub(timeout_seconds=self.config.timeouts.github_api_timeout_seconds)
+                self.github = GitHub(
+                    circuit_breaker_config=self.config.circuit_breaker,
+                    timeout_seconds=self.config.timeouts.github_api_timeout_seconds,
+                )
 
                 logger.info("Database and GitHub reconnected")
 

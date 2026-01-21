@@ -50,6 +50,14 @@ class RetryConfig:
 
 
 @dataclass
+class CircuitBreakerConfig:
+    failure_threshold: int = 5  # Number of consecutive failures before opening circuit
+    recovery_timeout_seconds: int = 60  # Time to wait before attempting recovery
+    half_open_max_calls: int = 3  # Max calls allowed in half-open state
+    backoff_multiplier: float = 2.0  # Multiplier for exponential backoff on recovery timeout
+
+
+@dataclass
 class ClaudeConfig:
     command: str = "claude"
     non_interactive_args: list[str] = field(default_factory=lambda: ["--dangerously-skip-permissions"])
@@ -80,6 +88,7 @@ class Config:
     priorities: PrioritiesConfig = field(default_factory=PrioritiesConfig)
     cleanup: CleanupConfig = field(default_factory=CleanupConfig)
     retry: RetryConfig = field(default_factory=RetryConfig)
+    circuit_breaker: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
     _config_path: Optional[str] = field(default=None, repr=False)  # Track source config path for spawned workers
 
     @classmethod
@@ -157,6 +166,15 @@ class Config:
                 max_retries=retry.get("max_retries", config.retry.max_retries),
                 initial_delay_seconds=retry.get("initial_delay_seconds", config.retry.initial_delay_seconds),
                 backoff_multiplier=retry.get("backoff_multiplier", config.retry.backoff_multiplier),
+            )
+
+        if "circuit_breaker" in data:
+            cb = data["circuit_breaker"]
+            config.circuit_breaker = CircuitBreakerConfig(
+                failure_threshold=cb.get("failure_threshold", config.circuit_breaker.failure_threshold),
+                recovery_timeout_seconds=cb.get("recovery_timeout_seconds", config.circuit_breaker.recovery_timeout_seconds),
+                half_open_max_calls=cb.get("half_open_max_calls", config.circuit_breaker.half_open_max_calls),
+                backoff_multiplier=cb.get("backoff_multiplier", config.circuit_breaker.backoff_multiplier),
             )
 
         return config
