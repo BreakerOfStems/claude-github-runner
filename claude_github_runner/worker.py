@@ -226,45 +226,16 @@ class Worker:
         # Claim on GitHub and post starting comment
         self._claim_on_github(job, run_id)
 
-        # Clone repository
-        logger.info(f"Cloning {job.repo}")
-        self.github.clone_repo(job.repo, str(paths.repo))
-
-        git = Git(paths.repo)
-
-        # Determine base branch - use config override or auto-detect from repo
-        base_branch = self.config.branching.base_branch
-        if base_branch == "main":
-            # Default value - auto-detect the actual default branch
-            try:
-                detected_branch = self.github.get_default_branch(job.repo)
-                if detected_branch:
-                    base_branch = detected_branch
-                    logger.info(f"Auto-detected default branch: {base_branch}")
-            except Exception as e:
-                logger.warning(f"Failed to detect default branch, using 'main': {e}")
-
-        # Checkout base branch
-        git.checkout(base_branch)
+        # Set up repository and determine branches
+        git, base_branch = self._setup_repository(job, paths)
 
         # Create working branch
-        slug = slugify(job.issue.title)
-        branch_name = f"{self.config.branching.branch_prefix}/{job.target_number}-{slug}"
+        branch_name = self._get_branch_name(job)
         self.db.update_run_status(run_id, RunStatus.RUNNING, branch=branch_name)
 
-        # Check if branch already exists on remote
-        git.fetch()
-        if git.branch_exists(branch_name, remote=True):
-            logger.info(f"Branch {branch_name} exists on remote, checking out")
-            git.checkout(branch_name)
-            # Try to rebase onto base branch
-            if not git.rebase(f"origin/{base_branch}"):
-                logger.warning("Rebase failed, handling conflicts")
-                git.abort_rebase()
-                self._handle_merge_conflict(job, run_id, paths, git)
-                return
-        else:
-            git.create_branch(branch_name)
+        # Checkout or create the working branch
+        if not self._setup_working_branch(git, branch_name, base_branch, job, run_id, paths):
+            return  # Merge conflict handled
 
         # Construct and write prompt
         prompt = self._build_prompt(job)
@@ -274,58 +245,156 @@ class Worker:
         logger.info("Invoking Claude Code")
         self._invoke_claude(paths, run_id)
 
-        # Check what Claude did - could be:
-        # 1. Made uncommitted changes (git status shows changes)
-        # 2. Already committed (check commits ahead of base)
-        # 3. Already committed AND pushed (check for PR)
-        # 4. Did nothing
+        # Handle Claude's output and finalize
+        self._handle_claude_output(git, job, run_id, paths, branch_name, base_branch)
 
+    def _setup_repository(self, job: Job, paths: WorkspacePaths) -> tuple[Git, str]:
+        """Clone repository and determine base branch.
+
+        Returns:
+            Tuple of (Git instance, base_branch name)
+        """
+        # Clone repository
+        logger.info(f"Cloning {job.repo}")
+        self.github.clone_repo(job.repo, str(paths.repo))
+
+        git = Git(paths.repo)
+
+        # Determine base branch - use config override or auto-detect from repo
+        base_branch = self._determine_base_branch(job.repo)
+
+        # Checkout base branch
+        git.checkout(base_branch)
+
+        return git, base_branch
+
+    def _determine_base_branch(self, repo: str) -> str:
+        """Determine the base branch for the repository."""
+        base_branch = self.config.branching.base_branch
+        if base_branch == "main":
+            # Default value - auto-detect the actual default branch
+            try:
+                detected_branch = self.github.get_default_branch(repo)
+                if detected_branch:
+                    base_branch = detected_branch
+                    logger.info(f"Auto-detected default branch: {base_branch}")
+            except Exception as e:
+                logger.warning(f"Failed to detect default branch, using 'main': {e}")
+        return base_branch
+
+    def _get_branch_name(self, job: Job) -> str:
+        """Generate the working branch name for a job."""
+        slug = slugify(job.issue.title)
+        return f"{self.config.branching.branch_prefix}/{job.target_number}-{slug}"
+
+    def _setup_working_branch(
+        self,
+        git: Git,
+        branch_name: str,
+        base_branch: str,
+        job: Job,
+        run_id: str,
+        paths: WorkspacePaths,
+    ) -> bool:
+        """Set up the working branch, handling existing branches and conflicts.
+
+        Returns:
+            True if setup succeeded, False if merge conflict occurred (already handled).
+        """
+        git.fetch()
+        if git.branch_exists(branch_name, remote=True):
+            logger.info(f"Branch {branch_name} exists on remote, checking out")
+            git.checkout(branch_name)
+            # Try to rebase onto base branch
+            if not git.rebase(f"origin/{base_branch}"):
+                logger.warning("Rebase failed, handling conflicts")
+                git.abort_rebase()
+                self._handle_merge_conflict(job, run_id, paths, git)
+                return False
+        else:
+            git.create_branch(branch_name)
+        return True
+
+    def _handle_claude_output(
+        self,
+        git: Git,
+        job: Job,
+        run_id: str,
+        paths: WorkspacePaths,
+        branch_name: str,
+        base_branch: str,
+    ):
+        """Handle Claude's output after invocation - check for changes, PRs, and finalize."""
         has_uncommitted = bool(git.status())
         has_new_commits = git.has_commits_ahead_of(f"origin/{base_branch}")
 
         logger.info(f"Post-Claude state: uncommitted={has_uncommitted}, new_commits={has_new_commits}")
 
-        # Check if Claude already created a PR (on our branch or any branch)
-        existing_pr = self.github.get_pr_for_branch(job.repo, branch_name)
+        # Check if Claude already created a PR
+        existing_pr = self._find_existing_pr(git, job, branch_name)
         if existing_pr:
             logger.info(f"Claude already created PR: {existing_pr.url}")
-            self.db.update_run_status(run_id, RunStatus.SUCCEEDED, pr_url=existing_pr.url)
-            self._handle_success(job, run_id, paths, existing_pr.url)
-            self._write_summary(paths, run_id, job, "succeeded", pr_url=existing_pr.url)
-            self.workspace_manager.cleanup(run_id, success=True)
+            self._finalize_success(job, run_id, paths, existing_pr.url)
             return
-
-        # Also check the current branch (Claude might have renamed it)
-        current_branch = git.get_current_branch()
-        if current_branch != branch_name:
-            logger.info(f"Branch changed: expected {branch_name}, got {current_branch}")
-            existing_pr = self.github.get_pr_for_branch(job.repo, current_branch)
-            if existing_pr:
-                logger.info(f"Found PR on current branch: {existing_pr.url}")
-                self.db.update_run_status(run_id, RunStatus.SUCCEEDED, pr_url=existing_pr.url)
-                self._handle_success(job, run_id, paths, existing_pr.url)
-                self._write_summary(paths, run_id, job, "succeeded", pr_url=existing_pr.url)
-                self.workspace_manager.cleanup(run_id, success=True)
-                return
 
         if not has_uncommitted and not has_new_commits:
             logger.info("No changes made by Claude")
             self._handle_no_changes(job, run_id, paths)
             return
 
-        # If Claude made uncommitted changes, commit them
+        # Commit uncommitted changes if any
         if has_uncommitted:
-            git.add_all()
-            diff = git.diff(staged=True)
-            paths.git_diff.write_text(diff)
-
-            commit_message = self._build_commit_message(job)
-            if not git.commit(commit_message):
-                logger.info("Nothing to commit after staging")
+            if not self._commit_changes(git, job, paths):
                 if not has_new_commits:
                     self._handle_no_changes(job, run_id, paths)
                     return
 
+        # Push and create PR
+        self._push_and_create_pr(git, job, run_id, paths, branch_name, base_branch)
+
+    def _find_existing_pr(self, git: Git, job: Job, branch_name: str):
+        """Find an existing PR created by Claude on the expected or current branch."""
+        # Check expected branch
+        existing_pr = self.github.get_pr_for_branch(job.repo, branch_name)
+        if existing_pr:
+            return existing_pr
+
+        # Check current branch (Claude might have renamed it)
+        current_branch = git.get_current_branch()
+        if current_branch != branch_name:
+            logger.info(f"Branch changed: expected {branch_name}, got {current_branch}")
+            existing_pr = self.github.get_pr_for_branch(job.repo, current_branch)
+            if existing_pr:
+                return existing_pr
+
+        return None
+
+    def _commit_changes(self, git: Git, job: Job, paths: WorkspacePaths) -> bool:
+        """Stage and commit uncommitted changes.
+
+        Returns:
+            True if commit succeeded, False if nothing to commit.
+        """
+        git.add_all()
+        diff = git.diff(staged=True)
+        paths.git_diff.write_text(diff)
+
+        commit_message = self._build_commit_message(job)
+        if not git.commit(commit_message):
+            logger.info("Nothing to commit after staging")
+            return False
+        return True
+
+    def _push_and_create_pr(
+        self,
+        git: Git,
+        job: Job,
+        run_id: str,
+        paths: WorkspacePaths,
+        branch_name: str,
+        base_branch: str,
+    ):
+        """Push changes and create/update PR."""
         # Push if there are unpushed commits
         if git.has_unpushed_commits(base_branch):
             logger.info(f"Pushing branch {branch_name}")
@@ -333,15 +402,13 @@ class Worker:
 
         # Create or update PR
         pr_url = self._create_or_update_pr(job, branch_name, paths, base_branch, run_id)
+        self._finalize_success(job, run_id, paths, pr_url)
+
+    def _finalize_success(self, job: Job, run_id: str, paths: WorkspacePaths, pr_url: str):
+        """Finalize a successful run - update status, labels, summary, and cleanup."""
         self.db.update_run_status(run_id, RunStatus.SUCCEEDED, pr_url=pr_url)
-
-        # Update labels on success
         self._handle_success(job, run_id, paths, pr_url)
-
-        # Write summary
         self._write_summary(paths, run_id, job, "succeeded", pr_url=pr_url)
-
-        # Cleanup
         self.workspace_manager.cleanup(run_id, success=True)
 
     def _claim_on_github(self, job: Job, run_id: str) -> bool:
@@ -470,25 +537,47 @@ class Worker:
 
     def _invoke_claude(self, paths: WorkspacePaths, run_id: str, retry_count: int = 0):
         """Invoke Claude Code non-interactively."""
-        import time
+        cmd = self._build_claude_command(paths)
+        stdout_path, stderr_path = self._get_claude_log_paths(paths)
 
-        # Build command for headless execution:
-        # --dangerously-skip-permissions: skip tool permission checks (from config)
-        # -p: provide the prompt
+        logger.info(f"Running Claude in: {paths.repo}")
+        logger.info(f"Log file: {paths.claude_log}")
+
+        returncode = self._run_claude_process(cmd, paths, stdout_path, stderr_path)
+
+        # Check for auth errors and retry if needed
+        if self._has_auth_error(stdout_path):
+            if retry_count < self.config.retry.max_retries:
+                return self._retry_with_backoff(paths, run_id, retry_count)
+            else:
+                logger.error("Auth error persists after retry - token may need manual refresh")
+
+        self._combine_log_files(paths, stdout_path, stderr_path)
+        self._log_claude_errors(returncode, stderr_path, run_id)
+
+    def _build_claude_command(self, paths: WorkspacePaths) -> list[str]:
+        """Build the command for headless Claude execution."""
         prompt = paths.prompt_file.read_text()
-        cmd = [
+        return [
             self.config.claude.command,
             *self.config.claude.non_interactive_args,
             "-p", prompt,
         ]
 
-        logger.info(f"Running Claude in: {paths.repo}")
-        logger.info(f"Log file: {paths.claude_log}")
-
-        # Stream output to files in real-time so we can tail them
+    def _get_claude_log_paths(self, paths: WorkspacePaths) -> tuple[Path, Path]:
+        """Get paths for Claude stdout and stderr log files."""
         stdout_path = paths.root / "claude_stdout.log"
         stderr_path = paths.root / "claude_stderr.log"
+        return stdout_path, stderr_path
 
+    def _run_claude_process(
+        self,
+        cmd: list[str],
+        paths: WorkspacePaths,
+        stdout_path: Path,
+        stderr_path: Path,
+    ) -> int:
+        """Run the Claude subprocess and return the exit code."""
         stdout_file = None
         stderr_file = None
         process = None
@@ -536,30 +625,37 @@ class Worker:
                 except Exception:
                     pass
 
-        # Check for auth errors that might be recoverable with retry
-        stdout_content = stdout_path.read_text()
-        if "authentication_error" in stdout_content or "OAuth token has expired" in stdout_content:
-            if retry_count < self.config.retry.max_retries:
-                # Calculate delay with exponential backoff
-                delay = self.config.retry.initial_delay_seconds * (
-                    self.config.retry.backoff_multiplier ** retry_count
-                )
-                logger.warning(
-                    f"Auth error detected, retrying (attempt {retry_count + 2}/{self.config.retry.max_retries + 1}) "
-                    f"after {delay:.1f}s delay..."
-                )
-                time.sleep(delay)
-                return self._invoke_claude(paths, run_id, retry_count + 1)
-            else:
-                logger.error("Auth error persists after retry - token may need manual refresh")
+        return returncode
 
-        # Combine into single log file for compatibility
+    def _has_auth_error(self, stdout_path: Path) -> bool:
+        """Check if the output contains an auth error."""
+        stdout_content = stdout_path.read_text()
+        return "authentication_error" in stdout_content or "OAuth token has expired" in stdout_content
+
+    def _retry_with_backoff(self, paths: WorkspacePaths, run_id: str, retry_count: int):
+        """Retry Claude invocation with exponential backoff."""
+        import time
+
+        delay = self.config.retry.initial_delay_seconds * (
+            self.config.retry.backoff_multiplier ** retry_count
+        )
+        logger.warning(
+            f"Auth error detected, retrying (attempt {retry_count + 2}/{self.config.retry.max_retries + 1}) "
+            f"after {delay:.1f}s delay..."
+        )
+        time.sleep(delay)
+        return self._invoke_claude(paths, run_id, retry_count + 1)
+
+    def _combine_log_files(self, paths: WorkspacePaths, stdout_path: Path, stderr_path: Path):
+        """Combine stdout and stderr into a single log file."""
         with open(paths.claude_log, "w") as log_file:
             log_file.write("=== STDOUT ===\n")
             log_file.write(stdout_path.read_text())
             log_file.write("\n=== STDERR ===\n")
             log_file.write(stderr_path.read_text())
 
+    def _log_claude_errors(self, returncode: int, stderr_path: Path, run_id: str):
+        """Log errors from Claude execution if any."""
         if returncode != 0:
             logger.warning(f"Claude exited with code {returncode}")
             # Capture full stderr for storage (with size limit)
