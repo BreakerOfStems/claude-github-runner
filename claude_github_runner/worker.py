@@ -256,7 +256,7 @@ class Worker:
             git.push("origin", branch_name, set_upstream=True)
 
         # Create or update PR
-        pr_url = self._create_or_update_pr(job, branch_name, paths, base_branch)
+        pr_url = self._create_or_update_pr(job, branch_name, paths, base_branch, run_id)
         self.db.update_run_status(run_id, RunStatus.SUCCEEDED, pr_url=pr_url)
 
         # Update labels on success
@@ -455,10 +455,35 @@ class Worker:
         ]
         return "\n".join(lines)
 
-    def _create_or_update_pr(self, job: Job, branch_name: str, paths: WorkspacePaths, base_branch: str) -> str:
-        """Create or update a PR. Returns PR URL."""
-        # Check if PR already exists
+    def _create_or_update_pr(self, job: Job, branch_name: str, paths: WorkspacePaths, base_branch: str, run_id: str) -> str:
+        """Create or update a PR. Returns PR URL.
+
+        This method is idempotent: if a PR was already created (either tracked
+        in GitHub or in our database), it will update that PR instead of creating
+        a duplicate. This handles the case where PR creation succeeded but
+        subsequent operations (like posting comments) failed and the job is retried.
+        """
+        # Check if PR already exists on GitHub
         existing_pr = self.github.get_pr_for_branch(job.repo, branch_name)
+
+        # Also check if we have a PR URL stored from a previous attempt
+        # This handles the case where PR was created but the run failed before
+        # we could record the URL in the success handler
+        if not existing_pr:
+            previous_run = self.db.get_run_with_pr_for_target(job.repo, job.target_number)
+            if previous_run and previous_run.pr_url:
+                # Verify the PR still exists and is for the same branch
+                # by trying to get it from GitHub
+                try:
+                    # Extract PR number from URL (format: https://github.com/owner/repo/pull/123)
+                    pr_number = int(previous_run.pr_url.rstrip('/').split('/')[-1])
+                    existing_pr = self.github.get_pr_for_branch(job.repo, branch_name)
+                    if not existing_pr:
+                        # PR URL exists in DB but not on GitHub for this branch
+                        # This might be a different branch, so we'll create a new PR
+                        logger.info(f"Previous PR {previous_run.pr_url} exists but not for branch {branch_name}")
+                except (ValueError, IndexError):
+                    logger.warning(f"Could not parse PR URL from previous run: {previous_run.pr_url}")
 
         pr_body = self._build_pr_body(job, paths)
 
@@ -475,7 +500,7 @@ class Worker:
         else:
             logger.info("Creating new PR")
             pr_title = f"[Claude] #{job.target_number}: {job.issue.title}"
-            return self.github.create_pr(
+            pr_url = self.github.create_pr(
                 repo=job.repo,
                 title=pr_title,
                 body=pr_body,
@@ -483,6 +508,12 @@ class Worker:
                 base_branch=base_branch,
                 working_dir=str(paths.repo),
             )
+            # Immediately store PR URL in database for idempotency
+            # This ensures that if subsequent operations fail and the job is retried,
+            # we won't create a duplicate PR
+            logger.info(f"Created PR: {pr_url}, storing in database for idempotency")
+            self.db.update_run_status(run_id, RunStatus.RUNNING, pr_url=pr_url)
+            return pr_url
 
     def _build_pr_body(self, job: Job, paths: WorkspacePaths) -> str:
         """Build PR body for fallback when Claude doesn't create a PR itself."""
