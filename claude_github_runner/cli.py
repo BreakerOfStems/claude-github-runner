@@ -46,7 +46,7 @@ class Runner:
     def __init__(self, config_path: Optional[str] = None):
         self.config = Config.load(config_path)
         self.db = Database(self.config.paths.db_path)
-        self.github = GitHub()
+        self.github = GitHub(timeout_seconds=self.config.timeouts.github_api_timeout_seconds)
         self.workspace_manager = Workspace(self.config)
         self.discovery = Discovery(self.config, self.db, self.github)
         self.worker = Worker(self.config, self.db, self.github, self.workspace_manager)
@@ -270,7 +270,7 @@ class Daemon:
         self.config_path = config_path
         self.config = Config.load(config_path)
         self.db = Database(self.config.paths.db_path)
-        self.github = GitHub()
+        self.github = GitHub(timeout_seconds=self.config.timeouts.github_api_timeout_seconds)
         self.workspace_manager = Workspace(self.config)
         self.discovery = Discovery(self.config, self.db, self.github)
 

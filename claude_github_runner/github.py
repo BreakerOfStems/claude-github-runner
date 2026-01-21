@@ -49,8 +49,11 @@ class GitHubError(Exception):
 class GitHub:
     """GitHub API wrapper using gh CLI."""
 
-    def __init__(self):
+    DEFAULT_TIMEOUT_SECONDS = 30
+
+    def __init__(self, timeout_seconds: Optional[int] = None):
         self._login: Optional[str] = None
+        self._timeout = timeout_seconds if timeout_seconds is not None else self.DEFAULT_TIMEOUT_SECONDS
 
     def _run_gh(self, args: list[str], check: bool = True) -> subprocess.CompletedProcess:
         """Run a gh command."""
@@ -62,8 +65,12 @@ class GitHub:
                 capture_output=True,
                 text=True,
                 check=check,
+                timeout=self._timeout,
             )
             return result
+        except subprocess.TimeoutExpired as e:
+            logger.error(f"gh command timed out after {self._timeout}s: {' '.join(cmd)}")
+            raise GitHubError(f"gh command timed out after {self._timeout}s") from e
         except subprocess.CalledProcessError as e:
             logger.error(f"gh command failed: {e.stderr}")
             raise GitHubError(f"gh command failed: {e.stderr}") from e
@@ -299,19 +306,23 @@ class GitHub:
         working_dir: str,
     ) -> str:
         """Create a pull request. Returns the PR URL."""
-        result = subprocess.run(
-            [
-                "gh", "pr", "create",
-                "--repo", repo,
-                "--title", title,
-                "--body", body,
-                "--head", head_branch,
-                "--base", base_branch,
-            ],
-            capture_output=True,
-            text=True,
-            cwd=working_dir,
-        )
+        try:
+            result = subprocess.run(
+                [
+                    "gh", "pr", "create",
+                    "--repo", repo,
+                    "--title", title,
+                    "--body", body,
+                    "--head", head_branch,
+                    "--base", base_branch,
+                ],
+                capture_output=True,
+                text=True,
+                cwd=working_dir,
+                timeout=self._timeout,
+            )
+        except subprocess.TimeoutExpired:
+            raise GitHubError(f"PR creation timed out after {self._timeout}s")
 
         if result.returncode != 0:
             raise GitHubError(f"Failed to create PR: {result.stderr}")
