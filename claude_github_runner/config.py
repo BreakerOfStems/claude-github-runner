@@ -74,6 +74,7 @@ class CleanupConfig:
     on_success: str = "delete"  # delete | keep | archive
     on_failure: str = "keep"    # delete | keep | archive
     keep_hours: int = 24
+    cleanup_batch_size: int = 100  # Max items to process per cleanup cycle
 
 
 @dataclass
@@ -158,6 +159,7 @@ class Config:
                 on_success=cleanup.get("on_success", config.cleanup.on_success),
                 on_failure=cleanup.get("on_failure", config.cleanup.on_failure),
                 keep_hours=cleanup.get("keep_hours", config.cleanup.keep_hours),
+                cleanup_batch_size=cleanup.get("cleanup_batch_size", config.cleanup.cleanup_batch_size),
             )
 
         if "retry" in data:
