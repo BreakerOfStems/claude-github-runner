@@ -149,13 +149,31 @@ class Runner:
         return self.worker.execute(job, run_id=run_id)
 
     def reap(self) -> dict:
-        """Detect dead PIDs and mark stale runs."""
+        """Detect dead PIDs and mark stale runs.
+
+        Also attempts to reap any zombie processes that may have accumulated
+        if SIGCHLD handling was not properly configured.
+        """
         logger.info("Starting reap")
 
         results = {
             "dead_pids": [],
             "stale_runs": [],
+            "reaped_zombies": [],
         }
+
+        # First, try to reap any zombie processes (non-blocking)
+        # This handles cases where SIGCHLD handler wasn't installed
+        while True:
+            try:
+                pid, status = os.waitpid(-1, os.WNOHANG)
+                if pid == 0:
+                    break
+                results["reaped_zombies"].append(pid)
+                logger.info(f"Reaped zombie process {pid}")
+            except ChildProcessError:
+                # No children to wait for
+                break
 
         # Check running runs for dead PIDs
         running_runs = self.db.get_running_runs()
@@ -207,7 +225,10 @@ class Runner:
         # Clean up old workspaces
         self.workspace_manager.cleanup_old_workspaces()
 
-        logger.info(f"Reap complete: {len(results['dead_pids'])} dead PIDs, {len(results['stale_runs'])} stale runs")
+        if results["reaped_zombies"]:
+            logger.info(f"Reap complete: {len(results['dead_pids'])} dead PIDs, {len(results['stale_runs'])} stale runs, {len(results['reaped_zombies'])} zombies reaped")
+        else:
+            logger.info(f"Reap complete: {len(results['dead_pids'])} dead PIDs, {len(results['stale_runs'])} stale runs")
         return results
 
     def _get_available_slots(self) -> int:

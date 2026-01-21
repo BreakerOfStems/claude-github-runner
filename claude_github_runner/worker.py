@@ -1,16 +1,17 @@
 """Worker execution flow for processing jobs."""
 
+import atexit
 import json
 import logging
-import multiprocessing
 import os
 import re
+import signal
 import subprocess
 import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Set
 
 from .config import Config
 from .database import Database, Run, RunStatus, JobType
@@ -19,6 +20,66 @@ from .github import GitHub
 from .workspace import Workspace, WorkspacePaths, Git
 
 logger = logging.getLogger(__name__)
+
+# Track child PIDs for proper cleanup
+_child_pids: Set[int] = set()
+_original_sigchld_handler = None
+
+
+def _sigchld_handler(signum, frame):
+    """Handle SIGCHLD to reap zombie processes automatically.
+
+    This handler is installed when using fork-based concurrency to ensure
+    child processes are properly reaped without blocking the parent.
+    """
+    # Reap all terminated children (non-blocking)
+    while True:
+        try:
+            pid, status = os.waitpid(-1, os.WNOHANG)
+            if pid == 0:
+                # No more children to reap
+                break
+            # Remove from tracked set
+            _child_pids.discard(pid)
+            if os.WIFEXITED(status):
+                exit_code = os.WEXITSTATUS(status)
+                logger.debug(f"Child process {pid} exited with code {exit_code}")
+            elif os.WIFSIGNALED(status):
+                sig = os.WTERMSIG(status)
+                logger.debug(f"Child process {pid} killed by signal {sig}")
+        except ChildProcessError:
+            # No children to wait for
+            break
+        except Exception as e:
+            logger.warning(f"Error in SIGCHLD handler: {e}")
+            break
+
+
+def _install_sigchld_handler():
+    """Install SIGCHLD handler for automatic child reaping."""
+    global _original_sigchld_handler
+    if _original_sigchld_handler is None:
+        _original_sigchld_handler = signal.signal(signal.SIGCHLD, _sigchld_handler)
+        logger.debug("Installed SIGCHLD handler for child process reaping")
+
+
+def _cleanup_remaining_children():
+    """Clean up any remaining child processes at exit."""
+    for pid in list(_child_pids):
+        try:
+            # Check if process is still alive
+            os.kill(pid, 0)
+            logger.warning(f"Sending SIGTERM to remaining child process {pid}")
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            # Process already gone
+            _child_pids.discard(pid)
+        except Exception as e:
+            logger.warning(f"Error cleaning up child {pid}: {e}")
+
+
+# Register cleanup at exit
+atexit.register(_cleanup_remaining_children)
 
 
 def slugify(text: str, max_length: int = 30) -> str:
@@ -79,7 +140,12 @@ class Worker:
         return run_id
 
     def execute_async(self, job: Job, comment_id: Optional[int] = None) -> str:
-        """Execute a job in a background process. Returns the run_id immediately."""
+        """Execute a job in a background process. Returns the run_id immediately.
+
+        Uses os.fork() with proper SIGCHLD handling to automatically reap child
+        processes and prevent zombie accumulation. Child processes are tracked
+        and cleaned up at parent exit if still running.
+        """
         run_id = f"{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
 
         logger.info(f"Starting async run {run_id} for {job.repo}#{job.target_number} ({job.job_type.value})")
@@ -100,12 +166,19 @@ class Worker:
         # Create workspace before forking
         paths = self.workspace_manager.create(run_id)
 
+        # Install SIGCHLD handler to automatically reap children (idempotent)
+        _install_sigchld_handler()
+
         # Fork to a child process
         pid = os.fork()
 
         if pid == 0:
             # Child process - execute the job
+            exit_code = 0
             try:
+                # Reset signal handlers in child (don't inherit parent's SIGCHLD handler)
+                signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+
                 # Set up file-based logging for the child process
                 # This is critical because stdout/stderr may be closed after parent exits
                 log_file = paths.root / "worker.log"
@@ -119,7 +192,7 @@ class Worker:
                 root_logger.addHandler(file_handler)
                 root_logger.setLevel(logging.INFO)
 
-                logger.info(f"Child process started for run {run_id}")
+                logger.info(f"Child process {os.getpid()} started for run {run_id}")
 
                 # Reconnect to database (connection isn't safe to share across fork)
                 self.db = Database(self.config.paths.db_path)
@@ -130,14 +203,22 @@ class Worker:
                 self._execute_job(run_id, job, paths)
             except Exception as e:
                 logger.exception(f"Run {run_id} failed: {e}")
-                self.db.update_run_status(run_id, RunStatus.FAILED, error=str(e))
-                self._handle_failure(job, run_id, paths, str(e))
-                self.workspace_manager.cleanup(run_id, success=False)
+                exit_code = 1
+                try:
+                    self.db.update_run_status(run_id, RunStatus.FAILED, error=str(e))
+                    self._handle_failure(job, run_id, paths, str(e))
+                    self.workspace_manager.cleanup(run_id, success=False)
+                except Exception as cleanup_error:
+                    logger.exception(f"Failed to clean up after error: {cleanup_error}")
             finally:
+                # Flush logs before exit
+                logging.shutdown()
                 # Child must exit to avoid returning to parent's control flow
-                os._exit(0)
+                # Use exit code to signal success/failure to parent
+                os._exit(exit_code)
         else:
-            # Parent process - record the child PID and return immediately
+            # Parent process - track child PID and return immediately
+            _child_pids.add(pid)
             logger.info(f"Spawned child process {pid} for run {run_id}")
             self.db.update_run_status(run_id, RunStatus.CLAIMED, pid=pid)
             return run_id
