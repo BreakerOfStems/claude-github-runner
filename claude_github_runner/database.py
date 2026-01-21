@@ -1,4 +1,15 @@
-"""SQLite database layer for Claude GitHub Runner."""
+"""SQLite database layer for Claude GitHub Runner.
+
+This module provides the persistence layer for tracking runs, processed comments,
+and polling cursors. It uses SQLite for simplicity and portability.
+
+Schema documentation: docs/DATABASE.md
+
+Key design decisions:
+- Uses a partial unique index to enforce one active run per issue/PR
+- Timestamps stored as ISO 8601 strings for human readability
+- Enum values stored as lowercase strings matching Python enum values
+"""
 
 import os
 import sqlite3
@@ -12,22 +23,46 @@ from typing import Optional
 
 
 class RunStatus(Enum):
-    QUEUED = "queued"
-    CLAIMED = "claimed"
-    RUNNING = "running"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-    NEEDS_HUMAN = "needs-human"
+    """Status values for a run through its lifecycle.
+
+    State transitions:
+        QUEUED -> CLAIMED -> RUNNING -> SUCCEEDED | FAILED | NEEDS_HUMAN
+    """
+
+    QUEUED = "queued"  # Job created, waiting for available slot
+    CLAIMED = "claimed"  # Slot acquired, about to start execution
+    RUNNING = "running"  # Claude Code is actively processing
+    SUCCEEDED = "succeeded"  # Run completed successfully
+    FAILED = "failed"  # Run failed with an error
+    NEEDS_HUMAN = "needs-human"  # Run requires human intervention
 
 
 class JobType(Enum):
-    ISSUE_READY = "issue_ready"
-    MENTION_ISSUE = "mention_issue"
-    MENTION_PR = "mention_pr"
+    """Types of jobs that can trigger a run."""
+
+    ISSUE_READY = "issue_ready"  # Issue with 'ready' label picked up from queue
+    MENTION_ISSUE = "mention_issue"  # Response to @mention in issue comment
+    MENTION_PR = "mention_pr"  # Response to @mention in PR comment
 
 
 @dataclass
 class Run:
+    """Represents a single execution run.
+
+    Attributes:
+        run_id: Unique identifier in format YYYYMMDD-HHMMSS-<random>
+        repo: Repository in owner/repo format
+        target_number: Issue or PR number being processed
+        job_type: Type of job that triggered this run
+        status: Current execution status
+        pid: Process ID of the forked worker (if running)
+        branch: Git branch created for this run (e.g., claude/42-fix-bug)
+        pr_url: URL of created/updated pull request
+        started_at: When the run started executing
+        ended_at: When the run completed
+        error: Error message if the run failed
+    """
+
     run_id: str
     repo: str
     target_number: int
@@ -44,17 +79,27 @@ class Run:
 
 @dataclass
 class ProcessedComment:
+    """Record of a GitHub comment that has been handled.
+
+    Used to prevent duplicate processing of the same @mention.
+    """
+
     repo: str
     target_number: int
-    comment_id: int
+    comment_id: int  # GitHub's unique comment ID
     comment_url: str
     comment_author: str
     created_at: datetime
-    run_id: str
+    run_id: str  # ID of the run that processed this comment
 
 
 @dataclass
 class Cursor:
+    """Polling cursor for a repository.
+
+    Tracks the last successful poll time to fetch only new comments.
+    """
+
     repo: str
     last_poll_at: datetime
 
@@ -123,8 +168,20 @@ class Database:
 
     Uses connection pooling with thread-local storage to efficiently
     reuse connections while maintaining thread safety.
+
+    Handles all database operations including schema initialization,
+    run management, comment tracking, and cursor updates.
+
+    The schema is automatically created on first connection. See
+    docs/DATABASE.md for detailed schema documentation.
+
+    Thread safety: Each method opens its own connection, so the class
+    can be used from multiple threads. However, SQLite itself may
+    block concurrent writes.
     """
 
+    # Schema definition using CREATE IF NOT EXISTS for idempotent initialization.
+    # The partial unique index on runs ensures only one active run per target.
     SCHEMA = """
     CREATE TABLE IF NOT EXISTS runs (
         run_id TEXT PRIMARY KEY,
@@ -141,10 +198,16 @@ class Database:
         stderr_output TEXT
     );
 
+    -- Partial unique index: ensures only one active run per issue/PR.
+    -- This prevents race conditions where multiple workers might try to
+    -- process the same issue simultaneously.
     CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_active_target
     ON runs (repo, target_number)
     WHERE status IN ('queued', 'claimed', 'running');
 
+    -- Tracks processed comments to prevent duplicate handling.
+    -- The UNIQUE constraint on comment_id ensures each comment is
+    -- processed exactly once, even if seen in multiple poll cycles.
     CREATE TABLE IF NOT EXISTS processed_comments (
         repo TEXT NOT NULL,
         target_number INTEGER NOT NULL,
@@ -158,6 +221,9 @@ class Database:
     CREATE INDEX IF NOT EXISTS idx_processed_comments_repo
     ON processed_comments (repo);
 
+    -- Polling cursors: stores last poll timestamp per repository.
+    -- Used to fetch only new comments since last check, reducing
+    -- API calls and preventing reprocessing.
     CREATE TABLE IF NOT EXISTS cursors (
         repo TEXT PRIMARY KEY,
         last_poll_at TEXT
@@ -211,8 +277,15 @@ class Database:
         self._pool.close_connection()
 
     # Run operations
+
     def create_run(self, run: Run) -> bool:
-        """Create a new run. Returns False if active run exists for target."""
+        """Create a new run record.
+
+        Returns:
+            True if the run was created successfully.
+            False if an active run already exists for this target (due to
+            the partial unique index on active runs).
+        """
         with self._connect() as conn:
             try:
                 conn.execute(
@@ -319,7 +392,12 @@ class Database:
         error: Optional[str] = None,
         stderr_output: Optional[str] = None,
     ):
-        """Update run status and optional fields."""
+        """Update run status and optional fields.
+
+        Automatically sets timestamps:
+        - started_at is set when status becomes RUNNING
+        - ended_at is set when status becomes SUCCEEDED, FAILED, or NEEDS_HUMAN
+        """
         with self._connect() as conn:
             updates = ["status = ?"]
             values = [status.value]
@@ -409,8 +487,12 @@ class Database:
                 return False
 
     # Cursor operations
+
     def get_cursor(self, repo: str) -> Optional[datetime]:
-        """Get the last poll time for a repo."""
+        """Get the last poll time for a repo.
+
+        Returns None if the repo has never been polled.
+        """
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT last_poll_at FROM cursors WHERE repo = ?", (repo,)
@@ -420,7 +502,10 @@ class Database:
         return None
 
     def update_cursor(self, repo: str, last_poll_at: datetime):
-        """Update the last poll time for a repo."""
+        """Update the last poll time for a repo.
+
+        Uses SQLite's ON CONFLICT clause for atomic upsert behavior.
+        """
         with self._connect() as conn:
             conn.execute(
                 """
@@ -431,8 +516,13 @@ class Database:
             )
 
     # Maintenance operations
+
     def get_stale_runs(self, stale_minutes: int) -> list[Run]:
-        """Get runs that have been running longer than stale_minutes."""
+        """Get runs that have been running longer than stale_minutes.
+
+        Used by the reaper to identify potentially stuck runs that may
+        need to be marked as failed.
+        """
         cutoff = datetime.utcnow()
         with self._connect() as conn:
             rows = conn.execute(
