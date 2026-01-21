@@ -1,16 +1,17 @@
 """Worker execution flow for processing jobs."""
 
+import atexit
 import json
 import logging
-import multiprocessing
 import os
 import re
+import signal
 import subprocess
 import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Set
 
 from .config import Config
 from .database import Database, Run, RunStatus, JobType
@@ -19,6 +20,69 @@ from .github import GitHub
 from .workspace import Workspace, WorkspacePaths, Git
 
 logger = logging.getLogger(__name__)
+
+# Maximum size for stderr capture (100KB as specified in issue #29)
+MAX_STDERR_SIZE = 100 * 1024
+
+# Track child PIDs for proper cleanup
+_child_pids: Set[int] = set()
+_original_sigchld_handler = None
+
+
+def _sigchld_handler(signum, frame):
+    """Handle SIGCHLD to reap zombie processes automatically.
+
+    This handler is installed when using fork-based concurrency to ensure
+    child processes are properly reaped without blocking the parent.
+    """
+    # Reap all terminated children (non-blocking)
+    while True:
+        try:
+            pid, status = os.waitpid(-1, os.WNOHANG)
+            if pid == 0:
+                # No more children to reap
+                break
+            # Remove from tracked set
+            _child_pids.discard(pid)
+            if os.WIFEXITED(status):
+                exit_code = os.WEXITSTATUS(status)
+                logger.debug(f"Child process {pid} exited with code {exit_code}")
+            elif os.WIFSIGNALED(status):
+                sig = os.WTERMSIG(status)
+                logger.debug(f"Child process {pid} killed by signal {sig}")
+        except ChildProcessError:
+            # No children to wait for
+            break
+        except Exception as e:
+            logger.warning(f"Error in SIGCHLD handler: {e}")
+            break
+
+
+def _install_sigchld_handler():
+    """Install SIGCHLD handler for automatic child reaping."""
+    global _original_sigchld_handler
+    if _original_sigchld_handler is None:
+        _original_sigchld_handler = signal.signal(signal.SIGCHLD, _sigchld_handler)
+        logger.debug("Installed SIGCHLD handler for child process reaping")
+
+
+def _cleanup_remaining_children():
+    """Clean up any remaining child processes at exit."""
+    for pid in list(_child_pids):
+        try:
+            # Check if process is still alive
+            os.kill(pid, 0)
+            logger.warning(f"Sending SIGTERM to remaining child process {pid}")
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            # Process already gone
+            _child_pids.discard(pid)
+        except Exception as e:
+            logger.warning(f"Error cleaning up child {pid}: {e}")
+
+
+# Register cleanup at exit
+atexit.register(_cleanup_remaining_children)
 
 
 def slugify(text: str, max_length: int = 30) -> str:
@@ -41,28 +105,23 @@ class Worker:
     def execute(self, job: Job, comment_id: Optional[int] = None, run_id: Optional[str] = None) -> str:
         """Execute a job. Returns the run_id.
 
-        If run_id is provided, uses the existing run record (created by tick before spawning).
-        Otherwise creates a new run record (for manual runs).
+        If run_id is provided, uses the existing run record (created by tick/daemon before spawning).
+        Otherwise atomically claims the job by creating a new run record (for manual runs).
         """
         if run_id:
-            # Using existing run record created by tick()
+            # Using existing run record created by tick()/daemon
             logger.info(f"Using existing run {run_id} for {job.repo}#{job.target_number} ({job.job_type.value})")
         else:
-            # Manual run - create new run record
+            # Manual run - atomically claim the job
             run_id = f"{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
-            logger.info(f"Starting run {run_id} for {job.repo}#{job.target_number} ({job.job_type.value})")
+            logger.info(f"Attempting to claim job {job.repo}#{job.target_number} as run {run_id}")
 
-            run = Run(
-                run_id=run_id,
-                repo=job.repo,
-                target_number=job.target_number,
-                job_type=job.job_type,
-                status=RunStatus.QUEUED,
-            )
-
-            if not self.db.create_run(run):
-                logger.error(f"Failed to create run: active run exists for {job.repo}#{job.target_number}")
+            # Use atomic claim_job to prevent race conditions
+            if not self.db.claim_job(run_id, job.repo, job.target_number, job.job_type):
+                logger.warning(f"Failed to claim job: another run already active for {job.repo}#{job.target_number}")
                 raise RuntimeError("Active run exists for target")
+
+            logger.info(f"Successfully claimed job {job.repo}#{job.target_number} ({job.job_type.value})")
 
         # Create workspace
         paths = self.workspace_manager.create(run_id)
@@ -79,33 +138,39 @@ class Worker:
         return run_id
 
     def execute_async(self, job: Job, comment_id: Optional[int] = None) -> str:
-        """Execute a job in a background process. Returns the run_id immediately."""
+        """Execute a job in a background process. Returns the run_id immediately.
+
+        Uses os.fork() with proper SIGCHLD handling to automatically reap child
+        processes and prevent zombie accumulation. Child processes are tracked
+        and cleaned up at parent exit if still running.
+        """
         run_id = f"{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
 
-        logger.info(f"Starting async run {run_id} for {job.repo}#{job.target_number} ({job.job_type.value})")
+        logger.info(f"Attempting to claim job {job.repo}#{job.target_number} for async run {run_id}")
 
-        # Create run record
-        run = Run(
-            run_id=run_id,
-            repo=job.repo,
-            target_number=job.target_number,
-            job_type=job.job_type,
-            status=RunStatus.QUEUED,
-        )
-
-        if not self.db.create_run(run):
-            logger.error(f"Failed to create run: active run exists for {job.repo}#{job.target_number}")
+        # Atomically claim the job to prevent race conditions
+        if not self.db.claim_job(run_id, job.repo, job.target_number, job.job_type):
+            logger.warning(f"Failed to claim job: another run already active for {job.repo}#{job.target_number}")
             raise RuntimeError("Active run exists for target")
+
+        logger.info(f"Successfully claimed job {job.repo}#{job.target_number} ({job.job_type.value})")
 
         # Create workspace before forking
         paths = self.workspace_manager.create(run_id)
+
+        # Install SIGCHLD handler to automatically reap children (idempotent)
+        _install_sigchld_handler()
 
         # Fork to a child process
         pid = os.fork()
 
         if pid == 0:
             # Child process - execute the job
+            exit_code = 0
             try:
+                # Reset signal handlers in child (don't inherit parent's SIGCHLD handler)
+                signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+
                 # Set up file-based logging for the child process
                 # This is critical because stdout/stderr may be closed after parent exits
                 log_file = paths.root / "worker.log"
@@ -119,25 +184,36 @@ class Worker:
                 root_logger.addHandler(file_handler)
                 root_logger.setLevel(logging.INFO)
 
-                logger.info(f"Child process started for run {run_id}")
+                logger.info(f"Child process {os.getpid()} started for run {run_id}")
 
                 # Reconnect to database (connection isn't safe to share across fork)
                 self.db = Database(self.config.paths.db_path)
-                self.github = GitHub()
+                self.github = GitHub(
+                    circuit_breaker_config=self.config.circuit_breaker,
+                    timeout_seconds=self.config.timeouts.github_api_timeout_seconds,
+                )
 
                 logger.info("Database and GitHub reconnected")
 
                 self._execute_job(run_id, job, paths)
             except Exception as e:
                 logger.exception(f"Run {run_id} failed: {e}")
-                self.db.update_run_status(run_id, RunStatus.FAILED, error=str(e))
-                self._handle_failure(job, run_id, paths, str(e))
-                self.workspace_manager.cleanup(run_id, success=False)
+                exit_code = 1
+                try:
+                    self.db.update_run_status(run_id, RunStatus.FAILED, error=str(e))
+                    self._handle_failure(job, run_id, paths, str(e))
+                    self.workspace_manager.cleanup(run_id, success=False)
+                except Exception as cleanup_error:
+                    logger.exception(f"Failed to clean up after error: {cleanup_error}")
             finally:
+                # Flush logs before exit
+                logging.shutdown()
                 # Child must exit to avoid returning to parent's control flow
-                os._exit(0)
+                # Use exit code to signal success/failure to parent
+                os._exit(exit_code)
         else:
-            # Parent process - record the child PID and return immediately
+            # Parent process - track child PID and return immediately
+            _child_pids.add(pid)
             logger.info(f"Spawned child process {pid} for run {run_id}")
             self.db.update_run_status(run_id, RunStatus.CLAIMED, pid=pid)
             return run_id
@@ -325,7 +401,7 @@ class Worker:
             git.push("origin", branch_name, set_upstream=True)
 
         # Create or update PR
-        pr_url = self._create_or_update_pr(job, branch_name, paths, base_branch)
+        pr_url = self._create_or_update_pr(job, branch_name, paths, base_branch, run_id)
         self._finalize_success(job, run_id, paths, pr_url)
 
     def _finalize_success(self, job: Job, run_id: str, paths: WorkspacePaths, pr_url: str):
@@ -335,16 +411,35 @@ class Worker:
         self._write_summary(paths, run_id, job, "succeeded", pr_url=pr_url)
         self.workspace_manager.cleanup(run_id, success=True)
 
-    def _claim_on_github(self, job: Job, run_id: str):
-        """Claim the issue/PR on GitHub and post starting comment."""
+    def _claim_on_github(self, job: Job, run_id: str) -> bool:
+        """Claim the issue/PR on GitHub and post starting comment.
+
+        Returns True if claim was successful, False if critical operations failed.
+        """
         try:
             # Remove ready label and add in-progress
-            self.github.remove_label(job.repo, job.target_number, self.config.labels.ready)
-            self.github.add_label(job.repo, job.target_number, self.config.labels.in_progress)
+            remove_ok = self.github.remove_label(job.repo, job.target_number, self.config.labels.ready)
+            add_ok = self.github.add_label(job.repo, job.target_number, self.config.labels.in_progress)
+
+            # Reconcile labels if initial operations had issues
+            if not remove_ok or not add_ok:
+                logger.warning("Label operations had issues, running reconciliation")
+                reconciled = self.github.reconcile_labels(
+                    job.repo,
+                    job.target_number,
+                    expected_labels=[self.config.labels.in_progress],
+                    unexpected_labels=[self.config.labels.ready],
+                )
+                if not reconciled:
+                    logger.error(f"Failed to reconcile labels for {job.repo}#{job.target_number}")
+                    return False
 
             # Assign to self
             login = self.github.get_authenticated_user()
-            self.github.assign_issue(job.repo, job.target_number, login)
+            assign_ok = self.github.assign_issue(job.repo, job.target_number, login)
+            if not assign_ok:
+                logger.warning(f"Failed to assign {login} to {job.repo}#{job.target_number}")
+                # Non-critical - continue anyway
 
             # Post starting comment
             if job.comment:
@@ -363,8 +458,10 @@ class Worker:
                 )
 
             logger.info(f"Claimed {job.repo}#{job.target_number}")
+            return True
         except Exception as e:
             logger.warning(f"Failed to claim on GitHub: {e}")
+            return False
 
     def _build_prompt(self, job: Job) -> str:
         """Build the prompt for Claude Code."""
@@ -456,7 +553,7 @@ class Worker:
                 logger.error("Auth error persists after retry - token may need manual refresh")
 
         self._combine_log_files(paths, stdout_path, stderr_path)
-        self._log_claude_errors(returncode, stderr_path)
+        self._log_claude_errors(returncode, stderr_path, run_id)
 
     def _build_claude_command(self, paths: WorkspacePaths) -> list[str]:
         """Build the command for headless Claude execution."""
@@ -481,7 +578,15 @@ class Worker:
         stderr_path: Path,
     ) -> int:
         """Run the Claude subprocess and return the exit code."""
-        with open(stdout_path, "w") as stdout_file, open(stderr_path, "w") as stderr_file:
+        stdout_file = None
+        stderr_file = None
+        process = None
+        returncode = -1
+
+        try:
+            stdout_file = open(stdout_path, "w")
+            stderr_file = open(stderr_path, "w")
+
             process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.DEVNULL,
@@ -492,12 +597,35 @@ class Worker:
             )
 
             try:
-                return process.wait(timeout=self.config.timeouts.run_timeout_minutes * 60)
+                returncode = process.wait(timeout=self.config.timeouts.run_timeout_minutes * 60)
             except subprocess.TimeoutExpired:
                 logger.warning(f"Claude timed out after {self.config.timeouts.run_timeout_minutes} minutes")
                 process.kill()
                 process.wait()
-                return -1
+                returncode = -1
+        except Exception:
+            # Ensure process is terminated if an error occurs
+            if process is not None:
+                try:
+                    process.kill()
+                    process.wait()
+                except Exception:
+                    pass
+            raise
+        finally:
+            # Always close file handles
+            if stdout_file is not None:
+                try:
+                    stdout_file.close()
+                except Exception:
+                    pass
+            if stderr_file is not None:
+                try:
+                    stderr_file.close()
+                except Exception:
+                    pass
+
+        return returncode
 
     def _has_auth_error(self, stdout_path: Path) -> bool:
         """Check if the output contains an auth error."""
@@ -526,14 +654,26 @@ class Worker:
             log_file.write("\n=== STDERR ===\n")
             log_file.write(stderr_path.read_text())
 
-    def _log_claude_errors(self, returncode: int, stderr_path: Path):
+    def _log_claude_errors(self, returncode: int, stderr_path: Path, run_id: str):
         """Log errors from Claude execution if any."""
         if returncode != 0:
             logger.warning(f"Claude exited with code {returncode}")
+            # Capture full stderr for storage (with size limit)
             stderr_content = stderr_path.read_text().strip()
             if stderr_content:
-                for line in stderr_content.split('\n')[:10]:
+                # Log truncated version to console
+                stderr_lines = stderr_content.split('\n')
+                for line in stderr_lines[:10]:
                     logger.warning(f"Claude stderr: {line}")
+                if len(stderr_lines) > 10:
+                    logger.warning(f"Claude stderr: ... ({len(stderr_lines) - 10} more lines, see full output via 'cgr logs {run_id} --stderr')")
+
+                # Store full stderr in database (truncated to MAX_STDERR_SIZE)
+                full_stderr = stderr_content[:MAX_STDERR_SIZE]
+                if len(stderr_content) > MAX_STDERR_SIZE:
+                    full_stderr += f"\n\n... (truncated, {len(stderr_content) - MAX_STDERR_SIZE} bytes omitted)"
+                self.db.update_run_status(run_id, RunStatus.RUNNING, stderr_output=full_stderr)
+            # Don't raise - Claude might have made partial progress
 
     def _build_commit_message(self, job: Job) -> str:
         """Build a commit message."""
@@ -547,10 +687,35 @@ class Worker:
         ]
         return "\n".join(lines)
 
-    def _create_or_update_pr(self, job: Job, branch_name: str, paths: WorkspacePaths, base_branch: str) -> str:
-        """Create or update a PR. Returns PR URL."""
-        # Check if PR already exists
+    def _create_or_update_pr(self, job: Job, branch_name: str, paths: WorkspacePaths, base_branch: str, run_id: str) -> str:
+        """Create or update a PR. Returns PR URL.
+
+        This method is idempotent: if a PR was already created (either tracked
+        in GitHub or in our database), it will update that PR instead of creating
+        a duplicate. This handles the case where PR creation succeeded but
+        subsequent operations (like posting comments) failed and the job is retried.
+        """
+        # Check if PR already exists on GitHub
         existing_pr = self.github.get_pr_for_branch(job.repo, branch_name)
+
+        # Also check if we have a PR URL stored from a previous attempt
+        # This handles the case where PR was created but the run failed before
+        # we could record the URL in the success handler
+        if not existing_pr:
+            previous_run = self.db.get_run_with_pr_for_target(job.repo, job.target_number)
+            if previous_run and previous_run.pr_url:
+                # Verify the PR still exists and is for the same branch
+                # by trying to get it from GitHub
+                try:
+                    # Extract PR number from URL (format: https://github.com/owner/repo/pull/123)
+                    pr_number = int(previous_run.pr_url.rstrip('/').split('/')[-1])
+                    existing_pr = self.github.get_pr_for_branch(job.repo, branch_name)
+                    if not existing_pr:
+                        # PR URL exists in DB but not on GitHub for this branch
+                        # This might be a different branch, so we'll create a new PR
+                        logger.info(f"Previous PR {previous_run.pr_url} exists but not for branch {branch_name}")
+                except (ValueError, IndexError):
+                    logger.warning(f"Could not parse PR URL from previous run: {previous_run.pr_url}")
 
         pr_body = self._build_pr_body(job, paths)
 
@@ -567,7 +732,7 @@ class Worker:
         else:
             logger.info("Creating new PR")
             pr_title = f"[Claude] #{job.target_number}: {job.issue.title}"
-            return self.github.create_pr(
+            pr_url = self.github.create_pr(
                 repo=job.repo,
                 title=pr_title,
                 body=pr_body,
@@ -575,6 +740,12 @@ class Worker:
                 base_branch=base_branch,
                 working_dir=str(paths.repo),
             )
+            # Immediately store PR URL in database for idempotency
+            # This ensures that if subsequent operations fail and the job is retried,
+            # we won't create a duplicate PR
+            logger.info(f"Created PR: {pr_url}, storing in database for idempotency")
+            self.db.update_run_status(run_id, RunStatus.RUNNING, pr_url=pr_url)
+            return pr_url
 
     def _build_pr_body(self, job: Job, paths: WorkspacePaths) -> str:
         """Build PR body for fallback when Claude doesn't create a PR itself."""
@@ -616,7 +787,16 @@ class Worker:
         """Handle successful completion."""
         try:
             # Remove in-progress label
-            self.github.remove_label(job.repo, job.target_number, self.config.labels.in_progress)
+            remove_ok = self.github.remove_label(job.repo, job.target_number, self.config.labels.in_progress)
+
+            # Reconcile labels if removal failed
+            if not remove_ok:
+                self.github.reconcile_labels(
+                    job.repo,
+                    job.target_number,
+                    expected_labels=[],
+                    unexpected_labels=[self.config.labels.in_progress, self.config.labels.ready],
+                )
 
             # Optionally add done label
             # self.github.add_label(job.repo, job.target_number, self.config.labels.done)
@@ -635,8 +815,17 @@ class Worker:
         """Handle job failure."""
         try:
             # Remove in-progress, add needs-human
-            self.github.remove_label(job.repo, job.target_number, self.config.labels.in_progress)
-            self.github.add_label(job.repo, job.target_number, self.config.labels.needs_human)
+            remove_ok = self.github.remove_label(job.repo, job.target_number, self.config.labels.in_progress)
+            add_ok = self.github.add_label(job.repo, job.target_number, self.config.labels.needs_human)
+
+            # Reconcile labels if operations had issues - critical to mark as needs-human
+            if not remove_ok or not add_ok:
+                self.github.reconcile_labels(
+                    job.repo,
+                    job.target_number,
+                    expected_labels=[self.config.labels.needs_human],
+                    unexpected_labels=[self.config.labels.in_progress, self.config.labels.ready],
+                )
 
             # Unassign the bot
             login = self.github.get_authenticated_user()
@@ -672,8 +861,17 @@ class Worker:
 
         try:
             # Remove in-progress, add needs-human (ready was already removed at claim time)
-            self.github.remove_label(job.repo, job.target_number, self.config.labels.in_progress)
-            self.github.add_label(job.repo, job.target_number, self.config.labels.needs_human)
+            remove_ok = self.github.remove_label(job.repo, job.target_number, self.config.labels.in_progress)
+            add_ok = self.github.add_label(job.repo, job.target_number, self.config.labels.needs_human)
+
+            # Reconcile labels if operations had issues - critical to mark as needs-human
+            if not remove_ok or not add_ok:
+                self.github.reconcile_labels(
+                    job.repo,
+                    job.target_number,
+                    expected_labels=[self.config.labels.needs_human],
+                    unexpected_labels=[self.config.labels.in_progress, self.config.labels.ready],
+                )
 
             # Unassign the bot
             login = self.github.get_authenticated_user()
@@ -703,8 +901,17 @@ class Worker:
         conflict_files = git.get_conflict_files()
 
         try:
-            # Add needs-human label
-            self.github.add_label(job.repo, job.target_number, self.config.labels.needs_human)
+            # Add needs-human label (in-progress should remain as we're still assigned)
+            add_ok = self.github.add_label(job.repo, job.target_number, self.config.labels.needs_human)
+
+            # Reconcile if add failed
+            if not add_ok:
+                self.github.reconcile_labels(
+                    job.repo,
+                    job.target_number,
+                    expected_labels=[self.config.labels.needs_human, self.config.labels.in_progress],
+                    unexpected_labels=[self.config.labels.ready],
+                )
 
             # Comment
             files_list = "\n".join(f"- `{f}`" for f in conflict_files)
