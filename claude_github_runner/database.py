@@ -348,3 +348,39 @@ class Database:
                 (stale_minutes,),
             ).fetchall()
             return [self._row_to_run(row) for row in rows]
+
+    def get_run_by_branch(self, repo: str, branch: str) -> Optional[Run]:
+        """Get a run by repo and branch name, useful for idempotency checks."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM runs
+                WHERE repo = ? AND branch = ?
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+                (repo, branch),
+            ).fetchone()
+            if row:
+                return self._row_to_run(row)
+        return None
+
+    def get_run_with_pr_for_target(self, repo: str, target_number: int) -> Optional[Run]:
+        """Get the most recent run that created a PR for a target.
+
+        Used for idempotency: if a previous run already created a PR,
+        we can detect this and avoid creating duplicates.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM runs
+                WHERE repo = ? AND target_number = ? AND pr_url IS NOT NULL
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+                (repo, target_number),
+            ).fetchone()
+            if row:
+                return self._row_to_run(row)
+        return None
