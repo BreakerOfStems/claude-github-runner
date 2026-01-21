@@ -1,0 +1,37 @@
+[Unit]
+Description=Claude GitHub Runner - daemon mode
+Documentation=https://github.com/anthropics/claude-github-runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=claude
+Group=claude
+WorkingDirectory=/home/claude
+
+# Main execution - runs continuously
+ExecStart=/usr/local/bin/claude-github-runner daemon
+
+# Restart on failure (but not on clean exit)
+Restart=on-failure
+RestartSec=10
+
+# Environment
+Environment="HOME=/home/claude"
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-github-runner
+
+# Security hardening
+# Note: We can't use ProtectHome=read-only because Claude Code needs to write
+# config files to the home directory (e.g., ~/.claude.json)
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
