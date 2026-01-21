@@ -33,6 +33,7 @@ class PollingConfig:
 class TimeoutsConfig:
     run_timeout_minutes: int = 60
     stale_run_minutes: int = 180
+    github_api_timeout_seconds: int = 30
 
 
 @dataclass
@@ -118,6 +119,7 @@ class Config:
             config.timeouts = TimeoutsConfig(
                 run_timeout_minutes=timeouts.get("run_timeout_minutes", config.timeouts.run_timeout_minutes),
                 stale_run_minutes=timeouts.get("stale_run_minutes", config.timeouts.stale_run_minutes),
+                github_api_timeout_seconds=timeouts.get("github_api_timeout_seconds", config.timeouts.github_api_timeout_seconds),
             )
 
         if "paths" in data:
