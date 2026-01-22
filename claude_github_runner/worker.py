@@ -7,17 +7,15 @@ import os
 import re
 import signal
 import subprocess
-import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Set
 
 from .config import Config
-from .database import Database, Run, RunStatus, JobType
+from .database import Database, JobType, RunStatus
 from .discovery import Job
 from .github import GitHub
-from .workspace import Workspace, WorkspacePaths, Git
+from .workspace import Git, Workspace, WorkspacePaths
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +23,7 @@ logger = logging.getLogger(__name__)
 MAX_STDERR_SIZE = 100 * 1024
 
 # Track child PIDs for proper cleanup
-_child_pids: Set[int] = set()
+_child_pids: set[int] = set()
 _original_sigchld_handler = None
 
 
@@ -102,7 +100,7 @@ class Worker:
         self.github = github
         self.workspace_manager = workspace_manager
 
-    def execute(self, job: Job, comment_id: Optional[int] = None, run_id: Optional[str] = None) -> str:
+    def execute(self, job: Job, comment_id: int | None = None, run_id: str | None = None) -> str:
         """Execute a job. Returns the run_id.
 
         If run_id is provided, uses the existing run record (created by tick/daemon before spawning).
@@ -110,7 +108,9 @@ class Worker:
         """
         if run_id:
             # Using existing run record created by tick()/daemon
-            logger.info(f"Using existing run {run_id} for {job.repo}#{job.target_number} ({job.job_type.value})")
+            logger.info(
+                f"Using existing run {run_id} for {job.repo}#{job.target_number} ({job.job_type.value})"
+            )
         else:
             # Manual run - atomically claim the job
             run_id = f"{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
@@ -118,10 +118,14 @@ class Worker:
 
             # Use atomic claim_job to prevent race conditions
             if not self.db.claim_job(run_id, job.repo, job.target_number, job.job_type):
-                logger.warning(f"Failed to claim job: another run already active for {job.repo}#{job.target_number}")
+                logger.warning(
+                    f"Failed to claim job: another run already active for {job.repo}#{job.target_number}"
+                )
                 raise RuntimeError("Active run exists for target")
 
-            logger.info(f"Successfully claimed job {job.repo}#{job.target_number} ({job.job_type.value})")
+            logger.info(
+                f"Successfully claimed job {job.repo}#{job.target_number} ({job.job_type.value})"
+            )
 
         # Create workspace
         paths = self.workspace_manager.create(run_id)
@@ -137,7 +141,7 @@ class Worker:
 
         return run_id
 
-    def execute_async(self, job: Job, comment_id: Optional[int] = None) -> str:
+    def execute_async(self, job: Job, comment_id: int | None = None) -> str:
         """Execute a job in a background process. Returns the run_id immediately.
 
         Uses os.fork() with proper SIGCHLD handling to automatically reap child
@@ -146,14 +150,20 @@ class Worker:
         """
         run_id = f"{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
 
-        logger.info(f"Attempting to claim job {job.repo}#{job.target_number} for async run {run_id}")
+        logger.info(
+            f"Attempting to claim job {job.repo}#{job.target_number} for async run {run_id}"
+        )
 
         # Atomically claim the job to prevent race conditions
         if not self.db.claim_job(run_id, job.repo, job.target_number, job.job_type):
-            logger.warning(f"Failed to claim job: another run already active for {job.repo}#{job.target_number}")
+            logger.warning(
+                f"Failed to claim job: another run already active for {job.repo}#{job.target_number}"
+            )
             raise RuntimeError("Active run exists for target")
 
-        logger.info(f"Successfully claimed job {job.repo}#{job.target_number} ({job.job_type.value})")
+        logger.info(
+            f"Successfully claimed job {job.repo}#{job.target_number} ({job.job_type.value})"
+        )
 
         # Create workspace before forking
         paths = self.workspace_manager.create(run_id)
@@ -175,10 +185,12 @@ class Worker:
                 # This is critical because stdout/stderr may be closed after parent exits
                 log_file = paths.root / "worker.log"
                 file_handler = logging.FileHandler(log_file)
-                file_handler.setFormatter(logging.Formatter(
-                    "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-                    datefmt="%Y-%m-%d %H:%M:%S",
-                ))
+                file_handler.setFormatter(
+                    logging.Formatter(
+                        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S",
+                    )
+                )
                 root_logger = logging.getLogger()
                 root_logger.handlers.clear()
                 root_logger.addHandler(file_handler)
@@ -328,7 +340,9 @@ class Worker:
         has_uncommitted = bool(git.status())
         has_new_commits = git.has_commits_ahead_of(f"origin/{base_branch}")
 
-        logger.info(f"Post-Claude state: uncommitted={has_uncommitted}, new_commits={has_new_commits}")
+        logger.info(
+            f"Post-Claude state: uncommitted={has_uncommitted}, new_commits={has_new_commits}"
+        )
 
         # Check if Claude already created a PR
         existing_pr = self._find_existing_pr(git, job, branch_name)
@@ -418,8 +432,12 @@ class Worker:
         """
         try:
             # Remove ready label and add in-progress
-            remove_ok = self.github.remove_label(job.repo, job.target_number, self.config.labels.ready)
-            add_ok = self.github.add_label(job.repo, job.target_number, self.config.labels.in_progress)
+            remove_ok = self.github.remove_label(
+                job.repo, job.target_number, self.config.labels.ready
+            )
+            add_ok = self.github.add_label(
+                job.repo, job.target_number, self.config.labels.in_progress
+            )
 
             # Reconcile labels if initial operations had issues
             if not remove_ok or not add_ok:
@@ -447,14 +465,14 @@ class Worker:
                 self.github.create_comment(
                     job.repo,
                     job.target_number,
-                    f"🤖 Thanks @{job.comment.author}! I'm starting work on this now.\n\n`Run ID: {run_id}`"
+                    f"🤖 Thanks @{job.comment.author}! I'm starting work on this now.\n\n`Run ID: {run_id}`",
                 )
             else:
                 # Starting from ready label
                 self.github.create_comment(
                     job.repo,
                     job.target_number,
-                    f"🤖 I'm starting work on this issue now.\n\n`Run ID: {run_id}`"
+                    f"🤖 I'm starting work on this issue now.\n\n`Run ID: {run_id}`",
                 )
 
             logger.info(f"Claimed {job.repo}#{job.target_number}")
@@ -478,60 +496,64 @@ class Worker:
         ]
 
         if job.comment:
-            lines.extend([
-                "## Request Comment",
-                "",
-                f"From @{job.comment.author}:",
-                "",
-                job.comment.body,
-                "",
-                f"Comment URL: {job.comment.url}",
-                "",
-            ])
+            lines.extend(
+                [
+                    "## Request Comment",
+                    "",
+                    f"From @{job.comment.author}:",
+                    "",
+                    job.comment.body,
+                    "",
+                    f"Comment URL: {job.comment.url}",
+                    "",
+                ]
+            )
 
-        lines.extend([
-            "## Execution Mode: Unattended/Headless",
-            "",
-            "You are running as an automated agent. There is no human watching. Your output will be captured and reviewed later.",
-            "",
-            "### Your workflow:",
-            "1. Explore the codebase to understand patterns and conventions",
-            "2. Implement the requested changes",
-            "3. Commit your changes with a descriptive message",
-            "4. Push to the current branch (you're already on a feature branch)",
-            f"5. Create a Pull Request with a clear description that includes `Closes #{job.target_number}` to link it to this issue",
-            "",
-            "### PR Description Requirements:",
-            "Your PR description MUST include:",
-            "- A summary of what was implemented",
-            f"- The text `Closes #{job.target_number}` (this links and auto-closes the issue when merged)",
-            "- Any important implementation notes or decisions made",
-            "",
-            "### What you MUST do:",
-            "- Make reasonable decisions based on available context",
-            "- Proceed with implementation without waiting for approval",
-            "- Keep changes minimal and focused",
-            "- Follow existing code style and conventions",
-            "- Create a PR when done - do not just leave uncommitted changes",
-            "",
-            "### What you must NOT do:",
-            "- Do NOT ask questions or wait for input",
-            "- Do NOT push to main/master branch directly",
-            "- Do NOT make changes if requirements are fundamentally ambiguous",
-            "",
-            "### If you cannot complete the task:",
-            "",
-            "If you are genuinely blocked and cannot proceed, you MUST output a clear handoff message.",
-            "Your final output should explain:",
-            "",
-            "1. **What you tried** - what steps you took, what you looked at",
-            "2. **Why you're blocked** - specific missing info, ambiguity, or technical issue",
-            "3. **What you need** - specific questions or information that would unblock you",
-            "4. **Suggested next steps** - what the human should do or clarify",
-            "",
-            "This output will be posted as a comment on the issue so the human knows exactly how to help.",
-            "",
-        ])
+        lines.extend(
+            [
+                "## Execution Mode: Unattended/Headless",
+                "",
+                "You are running as an automated agent. There is no human watching. Your output will be captured and reviewed later.",
+                "",
+                "### Your workflow:",
+                "1. Explore the codebase to understand patterns and conventions",
+                "2. Implement the requested changes",
+                "3. Commit your changes with a descriptive message",
+                "4. Push to the current branch (you're already on a feature branch)",
+                f"5. Create a Pull Request with a clear description that includes `Closes #{job.target_number}` to link it to this issue",
+                "",
+                "### PR Description Requirements:",
+                "Your PR description MUST include:",
+                "- A summary of what was implemented",
+                f"- The text `Closes #{job.target_number}` (this links and auto-closes the issue when merged)",
+                "- Any important implementation notes or decisions made",
+                "",
+                "### What you MUST do:",
+                "- Make reasonable decisions based on available context",
+                "- Proceed with implementation without waiting for approval",
+                "- Keep changes minimal and focused",
+                "- Follow existing code style and conventions",
+                "- Create a PR when done - do not just leave uncommitted changes",
+                "",
+                "### What you must NOT do:",
+                "- Do NOT ask questions or wait for input",
+                "- Do NOT push to main/master branch directly",
+                "- Do NOT make changes if requirements are fundamentally ambiguous",
+                "",
+                "### If you cannot complete the task:",
+                "",
+                "If you are genuinely blocked and cannot proceed, you MUST output a clear handoff message.",
+                "Your final output should explain:",
+                "",
+                "1. **What you tried** - what steps you took, what you looked at",
+                "2. **Why you're blocked** - specific missing info, ambiguity, or technical issue",
+                "3. **What you need** - specific questions or information that would unblock you",
+                "4. **Suggested next steps** - what the human should do or clarify",
+                "",
+                "This output will be posted as a comment on the issue so the human knows exactly how to help.",
+                "",
+            ]
+        )
 
         return "\n".join(lines)
 
@@ -561,7 +583,8 @@ class Worker:
         return [
             self.config.claude.command,
             *self.config.claude.non_interactive_args,
-            "-p", prompt,
+            "-p",
+            prompt,
         ]
 
     def _get_claude_log_paths(self, paths: WorkspacePaths) -> tuple[Path, Path]:
@@ -599,7 +622,9 @@ class Worker:
             try:
                 returncode = process.wait(timeout=self.config.timeouts.run_timeout_minutes * 60)
             except subprocess.TimeoutExpired:
-                logger.warning(f"Claude timed out after {self.config.timeouts.run_timeout_minutes} minutes")
+                logger.warning(
+                    f"Claude timed out after {self.config.timeouts.run_timeout_minutes} minutes"
+                )
                 process.kill()
                 process.wait()
                 returncode = -1
@@ -630,14 +655,16 @@ class Worker:
     def _has_auth_error(self, stdout_path: Path) -> bool:
         """Check if the output contains an auth error."""
         stdout_content = stdout_path.read_text()
-        return "authentication_error" in stdout_content or "OAuth token has expired" in stdout_content
+        return (
+            "authentication_error" in stdout_content or "OAuth token has expired" in stdout_content
+        )
 
     def _retry_with_backoff(self, paths: WorkspacePaths, run_id: str, retry_count: int):
         """Retry Claude invocation with exponential backoff."""
         import time
 
         delay = self.config.retry.initial_delay_seconds * (
-            self.config.retry.backoff_multiplier ** retry_count
+            self.config.retry.backoff_multiplier**retry_count
         )
         logger.warning(
             f"Auth error detected, retrying (attempt {retry_count + 2}/{self.config.retry.max_retries + 1}) "
@@ -662,11 +689,13 @@ class Worker:
             stderr_content = stderr_path.read_text().strip()
             if stderr_content:
                 # Log truncated version to console
-                stderr_lines = stderr_content.split('\n')
+                stderr_lines = stderr_content.split("\n")
                 for line in stderr_lines[:10]:
                     logger.warning(f"Claude stderr: {line}")
                 if len(stderr_lines) > 10:
-                    logger.warning(f"Claude stderr: ... ({len(stderr_lines) - 10} more lines, see full output via 'cgr logs {run_id} --stderr')")
+                    logger.warning(
+                        f"Claude stderr: ... ({len(stderr_lines) - 10} more lines, see full output via 'cgr logs {run_id} --stderr')"
+                    )
 
                 # Store full stderr in database (truncated to MAX_STDERR_SIZE)
                 full_stderr = stderr_content[:MAX_STDERR_SIZE]
@@ -680,14 +709,20 @@ class Worker:
         lines = [
             f"#{job.target_number}: {job.issue.title}",
             "",
-            f"Closes #{job.target_number}" if job.job_type == JobType.ISSUE_READY else f"Related to #{job.target_number}",
+            (
+                f"Closes #{job.target_number}"
+                if job.job_type == JobType.ISSUE_READY
+                else f"Related to #{job.target_number}"
+            ),
             "",
             "---",
             "Automated by claude-github-runner",
         ]
         return "\n".join(lines)
 
-    def _create_or_update_pr(self, job: Job, branch_name: str, paths: WorkspacePaths, base_branch: str, run_id: str) -> str:
+    def _create_or_update_pr(
+        self, job: Job, branch_name: str, paths: WorkspacePaths, base_branch: str, run_id: str
+    ) -> str:
         """Create or update a PR. Returns PR URL.
 
         This method is idempotent: if a PR was already created (either tracked
@@ -708,14 +743,18 @@ class Worker:
                 # by trying to get it from GitHub
                 try:
                     # Extract PR number from URL (format: https://github.com/owner/repo/pull/123)
-                    pr_number = int(previous_run.pr_url.rstrip('/').split('/')[-1])
+                    pr_number = int(previous_run.pr_url.rstrip("/").split("/")[-1])
                     existing_pr = self.github.get_pr_for_branch(job.repo, branch_name)
                     if not existing_pr:
                         # PR URL exists in DB but not on GitHub for this branch
                         # This might be a different branch, so we'll create a new PR
-                        logger.info(f"Previous PR {previous_run.pr_url} exists but not for branch {branch_name}")
+                        logger.info(
+                            f"Previous PR {previous_run.pr_url} exists but not for branch {branch_name}"
+                        )
                 except (ValueError, IndexError):
-                    logger.warning(f"Could not parse PR URL from previous run: {previous_run.pr_url}")
+                    logger.warning(
+                        f"Could not parse PR URL from previous run: {previous_run.pr_url}"
+                    )
 
         pr_body = self._build_pr_body(job, paths)
 
@@ -726,7 +765,7 @@ class Worker:
             self.github.add_pr_comment(
                 job.repo,
                 existing_pr.number,
-                f"🤖 Updated based on {'comment' if job.comment else 'issue'} request.\n\nRun ID: `{paths.root.name}`"
+                f"🤖 Updated based on {'comment' if job.comment else 'issue'} request.\n\nRun ID: `{paths.root.name}`",
             )
             return existing_pr.url
         else:
@@ -750,7 +789,7 @@ class Worker:
     def _build_pr_body(self, job: Job, paths: WorkspacePaths) -> str:
         """Build PR body for fallback when Claude doesn't create a PR itself."""
         lines = [
-            f"## Summary",
+            "## Summary",
             "",
             f"Automated implementation for #{job.target_number}: {job.issue.title}",
             "",
@@ -758,28 +797,36 @@ class Worker:
 
         # Add closing keyword for issues (this is critical for auto-close)
         if job.job_type == JobType.ISSUE_READY:
-            lines.extend([
-                f"Closes #{job.target_number}",
-                "",
-            ])
+            lines.extend(
+                [
+                    f"Closes #{job.target_number}",
+                    "",
+                ]
+            )
         else:
-            lines.extend([
-                f"Related to #{job.target_number}",
-                "",
-            ])
+            lines.extend(
+                [
+                    f"Related to #{job.target_number}",
+                    "",
+                ]
+            )
 
         if job.comment:
-            lines.extend([
-                "**Triggered by comment:**",
-                f"> {job.comment.body[:200]}{'...' if len(job.comment.body) > 200 else ''}",
-                "",
-            ])
+            lines.extend(
+                [
+                    "**Triggered by comment:**",
+                    f"> {job.comment.body[:200]}{'...' if len(job.comment.body) > 200 else ''}",
+                    "",
+                ]
+            )
 
-        lines.extend([
-            "---",
-            "",
-            "🤖 *This PR was automatically generated by [claude-github-runner](https://github.com/anthropics/claude-github-runner)*",
-        ])
+        lines.extend(
+            [
+                "---",
+                "",
+                "🤖 *This PR was automatically generated by [claude-github-runner](https://github.com/anthropics/claude-github-runner)*",
+            ]
+        )
 
         return "\n".join(lines)
 
@@ -787,7 +834,9 @@ class Worker:
         """Handle successful completion."""
         try:
             # Remove in-progress label
-            remove_ok = self.github.remove_label(job.repo, job.target_number, self.config.labels.in_progress)
+            remove_ok = self.github.remove_label(
+                job.repo, job.target_number, self.config.labels.in_progress
+            )
 
             # Reconcile labels if removal failed
             if not remove_ok:
@@ -806,17 +855,33 @@ class Worker:
                 self.github.create_comment(
                     job.repo,
                     job.target_number,
-                    f"🤖 I've created a PR to address this issue: {pr_url}\n\nPlease review and let me know if changes are needed."
+                    f"🤖 I've created a PR to address this issue: {pr_url}\n\nPlease review and let me know if changes are needed.",
                 )
         except Exception as e:
             logger.warning(f"Failed to update GitHub on success: {e}")
 
     def _handle_failure(self, job: Job, run_id: str, paths: WorkspacePaths, error: str):
-        """Handle job failure."""
+        """Handle job failure.
+
+        Before marking as failed, checks for orphaned PRs that may have been created
+        by Claude before the crash. If found, recovers the PR and marks as succeeded.
+        """
+        # Check for orphaned PRs first - Claude may have created a PR before crashing
+        recovered_pr_url = self.check_and_recover_orphan_pr(job.repo, job.target_number, run_id)
+        if recovered_pr_url:
+            # PR was recovered, write success summary instead of failure
+            self._write_summary(paths, run_id, job, "recovered", pr_url=recovered_pr_url)
+            return
+
+        # No orphaned PR found - handle as normal failure
         try:
             # Remove in-progress, add needs-human
-            remove_ok = self.github.remove_label(job.repo, job.target_number, self.config.labels.in_progress)
-            add_ok = self.github.add_label(job.repo, job.target_number, self.config.labels.needs_human)
+            remove_ok = self.github.remove_label(
+                job.repo, job.target_number, self.config.labels.in_progress
+            )
+            add_ok = self.github.add_label(
+                job.repo, job.target_number, self.config.labels.needs_human
+            )
 
             # Reconcile labels if operations had issues - critical to mark as needs-human
             if not remove_ok or not add_ok:
@@ -835,7 +900,7 @@ class Worker:
             self.github.create_comment(
                 job.repo,
                 job.target_number,
-                f"🤖 I encountered an error while working on this:\n\n```\n{error[:500]}\n```\n\nRun ID: `{run_id}`"
+                f"🤖 I encountered an error while working on this:\n\n```\n{error[:500]}\n```\n\nRun ID: `{run_id}`",
             )
         except Exception as e:
             logger.warning(f"Failed to update GitHub on failure: {e}")
@@ -854,15 +919,23 @@ class Worker:
                 # Extract stdout section (Claude's actual response)
                 if "=== STDOUT ===" in log_content:
                     stdout_start = log_content.index("=== STDOUT ===") + len("=== STDOUT ===\n")
-                    stdout_end = log_content.index("\n=== STDERR ===") if "\n=== STDERR ===" in log_content else len(log_content)
+                    stdout_end = (
+                        log_content.index("\n=== STDERR ===")
+                        if "\n=== STDERR ===" in log_content
+                        else len(log_content)
+                    )
                     claude_output = log_content[stdout_start:stdout_end].strip()
             except Exception as e:
                 logger.warning(f"Failed to read claude.log: {e}")
 
         try:
             # Remove in-progress, add needs-human (ready was already removed at claim time)
-            remove_ok = self.github.remove_label(job.repo, job.target_number, self.config.labels.in_progress)
-            add_ok = self.github.add_label(job.repo, job.target_number, self.config.labels.needs_human)
+            remove_ok = self.github.remove_label(
+                job.repo, job.target_number, self.config.labels.in_progress
+            )
+            add_ok = self.github.add_label(
+                job.repo, job.target_number, self.config.labels.needs_human
+            )
 
             # Reconcile labels if operations had issues - critical to mark as needs-human
             if not remove_ok or not add_ok:
@@ -902,14 +975,19 @@ class Worker:
 
         try:
             # Add needs-human label (in-progress should remain as we're still assigned)
-            add_ok = self.github.add_label(job.repo, job.target_number, self.config.labels.needs_human)
+            add_ok = self.github.add_label(
+                job.repo, job.target_number, self.config.labels.needs_human
+            )
 
             # Reconcile if add failed
             if not add_ok:
                 self.github.reconcile_labels(
                     job.repo,
                     job.target_number,
-                    expected_labels=[self.config.labels.needs_human, self.config.labels.in_progress],
+                    expected_labels=[
+                        self.config.labels.needs_human,
+                        self.config.labels.in_progress,
+                    ],
                     unexpected_labels=[self.config.labels.ready],
                 )
 
@@ -918,12 +996,14 @@ class Worker:
             self.github.create_comment(
                 job.repo,
                 job.target_number,
-                f"🤖 I encountered merge conflicts while rebasing:\n\n{files_list}\n\nPlease resolve these conflicts manually and I can continue working on this."
+                f"🤖 I encountered merge conflicts while rebasing:\n\n{files_list}\n\nPlease resolve these conflicts manually and I can continue working on this.",
             )
         except Exception as e:
             logger.warning(f"Failed to update GitHub on conflict: {e}")
 
-        self._write_summary(paths, run_id, job, "conflict", error=f"Conflict in: {', '.join(conflict_files)}")
+        self._write_summary(
+            paths, run_id, job, "conflict", error=f"Conflict in: {', '.join(conflict_files)}"
+        )
         self.workspace_manager.cleanup(run_id, success=False)
 
     def _write_summary(
@@ -932,8 +1012,8 @@ class Worker:
         run_id: str,
         job: Job,
         outcome: str,
-        pr_url: Optional[str] = None,
-        error: Optional[str] = None,
+        pr_url: str | None = None,
+        error: str | None = None,
     ):
         """Write summary.json for the run."""
         summary = {
@@ -951,3 +1031,64 @@ class Worker:
             summary["error"] = error
 
         paths.summary_json.write_text(json.dumps(summary, indent=2))
+
+    def check_and_recover_orphan_pr(self, repo: str, target_number: int, run_id: str) -> str | None:
+        """Check for orphaned PRs created by Claude but not recorded.
+
+        This handles the case where Claude Code crashes after creating a PR but
+        before the worker can capture the completion state. The PR exists but:
+        - Issue still has `in-progress` label
+        - No completion comment posted
+        - Database shows `running` status with no `pr_url`
+
+        Args:
+            repo: Repository in owner/repo format
+            target_number: Issue/PR number
+            run_id: Current run ID
+
+        Returns:
+            PR URL if an orphaned PR was found and recovered, None otherwise.
+        """
+        try:
+            # Look for PRs with our branch naming pattern
+            branch_prefix = self.config.branching.branch_prefix
+            matching_prs = self.github.find_prs_by_branch_pattern(
+                repo, branch_prefix, target_number, state="open"
+            )
+
+            if not matching_prs:
+                logger.debug(f"No orphaned PRs found for {repo}#{target_number}")
+                return None
+
+            # If we found a matching PR, this is likely an orphan
+            # (Claude created the PR but crashed before we could record it)
+            pr = matching_prs[0]  # Take the first match
+            logger.info(f"Found orphaned PR for {repo}#{target_number}: {pr.url}")
+
+            # Update database with the recovered PR URL
+            self.db.update_run_status(run_id, RunStatus.SUCCEEDED, pr_url=pr.url)
+
+            # Update GitHub state - remove in-progress, post recovery comment
+            try:
+                self.github.remove_label(repo, target_number, self.config.labels.in_progress)
+
+                # Post recovery comment on the issue
+                self.github.create_comment(
+                    repo,
+                    target_number,
+                    f"🤖 **Recovery Notice**: I found a PR that was created but not properly recorded "
+                    f"due to a process interruption: {pr.url}\n\n"
+                    f"The PR is ready for review. This run has been marked as completed.\n\n"
+                    f"`Run ID: {run_id}`",
+                )
+
+                logger.info(f"Successfully recovered orphaned PR {pr.url} for run {run_id}")
+            except Exception as e:
+                logger.warning(f"Failed to update GitHub during PR recovery: {e}")
+                # Still return the PR URL - we've recorded it in the database
+
+            return pr.url
+
+        except Exception as e:
+            logger.warning(f"Error checking for orphaned PRs: {e}")
+            return None
