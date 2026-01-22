@@ -35,6 +35,8 @@ class TimeoutsConfig:
     stale_run_minutes: int = 180
     max_run_duration_minutes: int = 75  # Maximum time before a run is considered stuck
     github_api_timeout_seconds: int = 30
+    subprocess_timeout_minutes: int = 55  # Kill Claude subprocess if exceeds this (fallback)
+    watchdog_grace_seconds: int = 10  # Grace period after fatal pattern before killing
 
 
 @dataclass
@@ -132,6 +134,8 @@ class Config:
                 stale_run_minutes=timeouts.get("stale_run_minutes", config.timeouts.stale_run_minutes),
                 max_run_duration_minutes=timeouts.get("max_run_duration_minutes", config.timeouts.max_run_duration_minutes),
                 github_api_timeout_seconds=timeouts.get("github_api_timeout_seconds", config.timeouts.github_api_timeout_seconds),
+                subprocess_timeout_minutes=timeouts.get("subprocess_timeout_minutes", config.timeouts.subprocess_timeout_minutes),
+                watchdog_grace_seconds=timeouts.get("watchdog_grace_seconds", config.timeouts.watchdog_grace_seconds),
             )
 
         if "paths" in data:
