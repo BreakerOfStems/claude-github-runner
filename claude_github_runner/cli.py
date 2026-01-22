@@ -156,21 +156,29 @@ class Runner:
         return self.worker.execute(job, run_id=run_id)
 
     def reap(self) -> dict:
-        """Detect dead PIDs and mark stale runs.
+        """Detect dead PIDs, mark stale runs, and fail timed-out runs.
 
         Also attempts to reap any zombie processes that may have accumulated
         if SIGCHLD handling was not properly configured. Before marking runs as
         failed, checks for orphaned PRs that may have been created by Claude
         before the crash.
+
+        Timeout reaping marks runs as failed if they've been active longer than
+        max_run_duration_minutes (default 75 minutes) and posts a comment on
+        the GitHub issue explaining the timeout.
         """
         logger.info("Starting reap")
 
         results = {
             "dead_pids": [],
             "stale_runs": [],
+            "timed_out_runs": [],
             "reaped_zombies": [],
             "recovered_prs": [],
         }
+
+        # Track processed run IDs to avoid double-processing
+        processed_run_ids = set()
 
         # First, try to reap any zombie processes (non-blocking)
         # This handles cases where SIGCHLD handler wasn't installed
@@ -190,6 +198,7 @@ class Runner:
         for run in running_runs:
             if run.pid and not is_pid_alive(run.pid):
                 logger.warning(f"Run {run.run_id} has dead PID {run.pid}")
+                processed_run_ids.add(run.run_id)
 
                 # Check for orphaned PRs before marking as failed
                 recovered_pr = self._check_and_recover_orphan_pr(run)
@@ -219,52 +228,121 @@ class Runner:
                 except Exception as e:
                     logger.warning(f"Failed to release GitHub claim for {run.run_id}: {e}")
 
-        # Check for stale runs
-        stale_runs = self.db.get_stale_runs(self.config.timeouts.stale_run_minutes)
-        for run in stale_runs:
-            if run.run_id not in results["dead_pids"]:  # Don't double-count
-                logger.warning(f"Run {run.run_id} is stale (started at {run.started_at})")
+        # Check for timed-out runs (active runs exceeding max_run_duration_minutes)
+        timed_out_runs = self.db.get_timed_out_runs(self.config.timeouts.max_run_duration_minutes)
+        for run in timed_out_runs:
+            if run.run_id in processed_run_ids:
+                continue
+            processed_run_ids.add(run.run_id)
 
-                # Check for orphaned PRs before marking as failed
-                recovered_pr = self._check_and_recover_orphan_pr(run)
-                if recovered_pr:
-                    results["recovered_prs"].append(
-                        {
-                            "run_id": run.run_id,
-                            "pr_url": recovered_pr,
-                        }
-                    )
-                    # Still kill the process if alive
-                    if run.pid and is_pid_alive(run.pid):
-                        try:
-                            os.kill(run.pid, 9)
-                        except Exception:
-                            pass
-                    continue  # Skip marking as failed
+            logger.warning(
+                f"Run {run.run_id} timed out after {self.config.timeouts.max_run_duration_minutes} minutes "
+                f"(status: {run.status.value})"
+            )
 
-                self.db.update_run_status(
-                    run.run_id,
-                    RunStatus.FAILED,
-                    error=f"Run timed out after {self.config.timeouts.stale_run_minutes} minutes",
+            # Check for orphaned PRs before marking as failed
+            recovered_pr = self._check_and_recover_orphan_pr(run)
+            if recovered_pr:
+                results["recovered_prs"].append(
+                    {
+                        "run_id": run.run_id,
+                        "pr_url": recovered_pr,
+                    }
                 )
-                results["stale_runs"].append(run.run_id)
-
-                # Try to kill the process if it's still alive
+                # Still kill the process if alive
                 if run.pid and is_pid_alive(run.pid):
                     try:
                         os.kill(run.pid, 9)
                     except Exception:
                         pass
+                continue  # Skip marking as failed
 
-                # Release GitHub claim
+            # Mark as failed with timeout error
+            error_msg = f"Run timed out after {self.config.timeouts.max_run_duration_minutes} minutes"
+            self.db.update_run_status(
+                run.run_id,
+                RunStatus.FAILED,
+                error=error_msg,
+            )
+            results["timed_out_runs"].append(run.run_id)
+
+            # Try to kill the process if it's still alive
+            if run.pid and is_pid_alive(run.pid):
                 try:
-                    self.github.remove_label(
-                        run.repo, run.target_number, self.config.labels.in_progress
-                    )
-                    login = self.github.get_authenticated_user()
-                    self.github.unassign_issue(run.repo, run.target_number, login)
-                except Exception as e:
-                    logger.warning(f"Failed to release GitHub claim for {run.run_id}: {e}")
+                    os.kill(run.pid, 9)
+                    logger.info(f"Killed process {run.pid} for timed out run {run.run_id}")
+                except Exception:
+                    pass
+
+            # Post timeout comment on GitHub issue and release claim
+            try:
+                timeout_comment = (
+                    f"⚠️ **This run timed out** after {self.config.timeouts.max_run_duration_minutes} minutes "
+                    f"without completion.\n\n"
+                    f"**Run ID:** `{run.run_id}`\n"
+                    f"**Status at timeout:** `{run.status.value}`\n\n"
+                    f"The `{self.config.labels.in_progress}` label has been removed. "
+                    f"You may re-add the `{self.config.labels.ready}` label to retry, "
+                    f"or investigate the failure."
+                )
+                self.github.create_comment(run.repo, run.target_number, timeout_comment)
+                self.github.remove_label(
+                    run.repo, run.target_number, self.config.labels.in_progress
+                )
+                login = self.github.get_authenticated_user()
+                self.github.unassign_issue(run.repo, run.target_number, login)
+            except Exception as e:
+                logger.warning(f"Failed to update GitHub for timed out run {run.run_id}: {e}")
+
+        # Check for stale runs (legacy behavior, uses stale_run_minutes)
+        stale_runs = self.db.get_stale_runs(self.config.timeouts.stale_run_minutes)
+        for run in stale_runs:
+            if run.run_id in processed_run_ids:
+                continue
+            processed_run_ids.add(run.run_id)
+
+            logger.warning(f"Run {run.run_id} is stale (started at {run.started_at})")
+
+            # Check for orphaned PRs before marking as failed
+            recovered_pr = self._check_and_recover_orphan_pr(run)
+            if recovered_pr:
+                results["recovered_prs"].append(
+                    {
+                        "run_id": run.run_id,
+                        "pr_url": recovered_pr,
+                    }
+                )
+                # Still kill the process if alive
+                if run.pid and is_pid_alive(run.pid):
+                    try:
+                        os.kill(run.pid, 9)
+                    except Exception:
+                        pass
+                continue  # Skip marking as failed
+
+            self.db.update_run_status(
+                run.run_id,
+                RunStatus.FAILED,
+                error=f"Run timed out after {self.config.timeouts.stale_run_minutes} minutes",
+            )
+            results["stale_runs"].append(run.run_id)
+
+            # Try to kill the process if it's still alive
+            if run.pid and is_pid_alive(run.pid):
+                try:
+                    os.kill(run.pid, 9)
+                except Exception:
+                    pass
+
+            # Release GitHub claim
+            try:
+                self.github.remove_label(
+                    run.repo, run.target_number, self.config.labels.in_progress
+                )
+                login = self.github.get_authenticated_user()
+                self.github.unassign_issue(run.repo, run.target_number, login)
+            except Exception as e:
+                logger.warning(f"Failed to release GitHub claim for {run.run_id}: {e}")
 
         # Clean up old workspaces
         self.workspace_manager.cleanup_old_workspaces()
@@ -272,6 +350,7 @@ class Runner:
         log_parts = [
             f"{len(results['dead_pids'])} dead PIDs",
             f"{len(results['stale_runs'])} stale runs",
+            f"{len(results['timed_out_runs'])} timed out runs",
         ]
         if results["reaped_zombies"]:
             log_parts.append(f"{len(results['reaped_zombies'])} zombies reaped")
@@ -583,16 +662,80 @@ class Daemon:
             del self.running_jobs[run_id]
 
     def _cleanup_stale_runs(self):
-        """Clean up stale runs from DB (from previous daemon instances).
+        """Clean up stale and timed-out runs from DB (from previous daemon instances).
 
-        Before marking stale runs as failed, checks for orphaned PRs that
+        Before marking runs as failed, checks for orphaned PRs that
         may have been created by Claude before the timeout.
+
+        Handles two types of timeouts:
+        1. Timed-out runs: Active runs exceeding max_run_duration_minutes (posts GitHub comment)
+        2. Stale runs: Running runs exceeding stale_run_minutes (legacy behavior)
         """
+        processed_run_ids = set()
+
+        # First, handle timed-out runs (posts comment on GitHub)
+        timed_out_runs = self.db.get_timed_out_runs(self.config.timeouts.max_run_duration_minutes)
+
+        for run in timed_out_runs:
+            # Skip if we're tracking this run
+            if run.run_id in self.running_jobs:
+                continue
+            processed_run_ids.add(run.run_id)
+
+            # Check if PID is alive (could be from previous daemon)
+            if run.pid and is_pid_alive(run.pid):
+                # Try to kill it
+                try:
+                    os.kill(run.pid, signal.SIGTERM)
+                    time.sleep(1)
+                    if is_pid_alive(run.pid):
+                        os.kill(run.pid, signal.SIGKILL)
+                except Exception:
+                    pass
+
+            # Check for orphaned PRs before marking as failed
+            recovered_pr = self._check_and_recover_orphan_pr(run)
+            if recovered_pr:
+                logger.info(f"Recovered orphaned PR for timed out run {run.run_id}: {recovered_pr}")
+                continue  # Skip marking as failed
+
+            logger.warning(
+                f"Marking run {run.run_id} as failed (timed out after "
+                f"{self.config.timeouts.max_run_duration_minutes} minutes, status: {run.status.value})"
+            )
+            error_msg = f"Run timed out after {self.config.timeouts.max_run_duration_minutes} minutes"
+            self.db.update_run_status(
+                run.run_id,
+                RunStatus.FAILED,
+                error=error_msg,
+            )
+
+            # Post timeout comment on GitHub issue and release claim
+            try:
+                timeout_comment = (
+                    f"⚠️ **This run timed out** after {self.config.timeouts.max_run_duration_minutes} minutes "
+                    f"without completion.\n\n"
+                    f"**Run ID:** `{run.run_id}`\n"
+                    f"**Status at timeout:** `{run.status.value}`\n\n"
+                    f"The `{self.config.labels.in_progress}` label has been removed. "
+                    f"You may re-add the `{self.config.labels.ready}` label to retry, "
+                    f"or investigate the failure."
+                )
+                self.github.create_comment(run.repo, run.target_number, timeout_comment)
+                self.github.remove_label(
+                    run.repo, run.target_number, self.config.labels.in_progress
+                )
+                login = self.github.get_authenticated_user()
+                self.github.unassign_issue(run.repo, run.target_number, login)
+            except Exception as e:
+                logger.warning(f"Failed to update GitHub for timed out run {run.run_id}: {e}")
+
+        # Also handle legacy stale runs (without posting comment)
         stale_runs = self.db.get_stale_runs(self.config.timeouts.stale_run_minutes)
 
         for run in stale_runs:
-            # Skip if we're tracking this run
-            if run.run_id in self.running_jobs:
+            # Skip if we're tracking this run or already processed
+            if run.run_id in self.running_jobs or run.run_id in processed_run_ids:
                 continue
 
             # Check if PID is alive (could be from previous daemon)
