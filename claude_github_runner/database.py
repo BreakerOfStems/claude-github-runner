@@ -523,7 +523,6 @@ class Database:
         Used by the reaper to identify potentially stuck runs that may
         need to be marked as failed.
         """
-        cutoff = datetime.utcnow()
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -534,6 +533,51 @@ class Database:
                 (stale_minutes,),
             ).fetchall()
             return [self._row_to_run(row) for row in rows]
+
+    def get_timed_out_runs(self, timeout_minutes: int) -> list[Run]:
+        """Get active runs that have exceeded the timeout duration.
+
+        Used by the timeout reaper to identify runs stuck in any active state
+        (queued, claimed, running) for longer than the configured timeout.
+
+        For 'running' status, uses started_at timestamp.
+        For 'queued' and 'claimed' status, parses the timestamp from run_id
+        (format: YYYYMMDD-HHMMSS-<random>).
+        """
+        from datetime import timedelta
+
+        cutoff = datetime.utcnow() - timedelta(minutes=timeout_minutes)
+        timed_out = []
+
+        with self._connect() as conn:
+            # Get all active runs
+            rows = conn.execute(
+                """
+                SELECT * FROM runs
+                WHERE status IN ('queued', 'claimed', 'running')
+                """
+            ).fetchall()
+
+            for row in rows:
+                run = self._row_to_run(row)
+
+                # For running status, check started_at
+                if run.status == RunStatus.RUNNING and run.started_at:
+                    if run.started_at < cutoff:
+                        timed_out.append(run)
+                # For queued/claimed, parse timestamp from run_id
+                elif run.status in (RunStatus.QUEUED, RunStatus.CLAIMED):
+                    try:
+                        # run_id format: YYYYMMDD-HHMMSS-<random>
+                        timestamp_part = run.run_id[:15]  # YYYYMMDD-HHMMSS
+                        created_at = datetime.strptime(timestamp_part, "%Y%m%d-%H%M%S")
+                        if created_at < cutoff:
+                            timed_out.append(run)
+                    except (ValueError, IndexError):
+                        # If we can't parse the timestamp, skip this run
+                        pass
+
+            return timed_out
 
     def get_run_by_branch(self, repo: str, branch: str) -> Optional[Run]:
         """Get a run by repo and branch name, useful for idempotency checks."""
