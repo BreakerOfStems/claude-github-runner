@@ -5,8 +5,11 @@ import json
 import logging
 import os
 import re
+import select
 import signal
 import subprocess
+import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +24,16 @@ logger = logging.getLogger(__name__)
 
 # Maximum size for stderr capture (100KB as specified in issue #29)
 MAX_STDERR_SIZE = 100 * 1024
+
+# Fatal stderr patterns that indicate Claude is hung and won't recover
+# These patterns suggest an unhandled promise rejection or fatal error
+# where the process stays alive but does no work
+FATAL_STDERR_PATTERNS = [
+    "Error: No messages returned",
+    "unhandled promise rejection",
+    "FATAL:",
+    "panic:",
+]
 
 # Track child PIDs for proper cleanup
 _child_pids: set[int] = set()
@@ -600,34 +613,140 @@ class Worker:
         stdout_path: Path,
         stderr_path: Path,
     ) -> int:
-        """Run the Claude subprocess and return the exit code."""
+        """Run the Claude subprocess with watchdog monitoring and return the exit code.
+
+        The watchdog monitors stderr for fatal error patterns that indicate Claude
+        has entered a hung state (e.g., unhandled promise rejection). If detected,
+        the process is given a grace period to exit cleanly before being killed.
+        """
         stdout_file = None
         stderr_file = None
+        stderr_read_fd = None
         process = None
         returncode = -1
 
+        # Event to signal fatal error detected by stderr monitor
+        fatal_error_detected = threading.Event()
+        fatal_error_line = [None]  # Use list to allow modification in nested function
+        monitor_stop = threading.Event()
+
+        def stderr_monitor(read_fd: int, write_path: Path):
+            """Monitor stderr for fatal patterns while writing to file.
+
+            This runs in a separate thread, reading from the read end of a pipe
+            and writing to the stderr log file while checking for fatal patterns.
+            """
+            try:
+                with open(write_path, "w") as f:
+                    while not monitor_stop.is_set():
+                        # Use select to check if data is available (timeout 0.1s)
+                        try:
+                            readable, _, _ = select.select([read_fd], [], [], 0.1)
+                        except (ValueError, OSError):
+                            # File descriptor closed or invalid
+                            break
+
+                        if not readable:
+                            continue
+
+                        try:
+                            data = os.read(read_fd, 4096)
+                        except OSError:
+                            break
+
+                        if not data:
+                            # EOF - process closed stderr
+                            break
+
+                        text = data.decode("utf-8", errors="replace")
+                        f.write(text)
+                        f.flush()
+
+                        # Check for fatal patterns
+                        for pattern in FATAL_STDERR_PATTERNS:
+                            if pattern.lower() in text.lower():
+                                logger.warning(
+                                    f"Watchdog: Fatal pattern detected in stderr: {pattern!r}"
+                                )
+                                fatal_error_line[0] = text.strip()[:200]
+                                fatal_error_detected.set()
+                                # Continue monitoring to capture all stderr
+            except Exception as e:
+                logger.warning(f"Stderr monitor error: {e}")
+
         try:
             stdout_file = open(stdout_path, "w")
-            stderr_file = open(stderr_path, "w")
+
+            # Create a pipe for stderr so we can monitor it
+            stderr_read_fd, stderr_write_fd = os.pipe()
 
             process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.DEVNULL,
                 stdout=stdout_file,
-                stderr=stderr_file,
-                text=True,
+                stderr=stderr_write_fd,
+                text=False,  # Use binary mode for pipe
                 cwd=paths.repo,
             )
 
-            try:
-                returncode = process.wait(timeout=self.config.timeouts.run_timeout_minutes * 60)
-            except subprocess.TimeoutExpired:
-                logger.warning(
-                    f"Claude timed out after {self.config.timeouts.run_timeout_minutes} minutes"
-                )
-                process.kill()
-                process.wait()
+            # Close write end in parent - child owns it now
+            os.close(stderr_write_fd)
+            stderr_write_fd = None
+
+            # Start stderr monitoring thread
+            monitor_thread = threading.Thread(
+                target=stderr_monitor,
+                args=(stderr_read_fd, stderr_path),
+                daemon=True,
+            )
+            monitor_thread.start()
+
+            # Use subprocess timeout as the primary timeout (fallback)
+            subprocess_timeout = self.config.timeouts.subprocess_timeout_minutes * 60
+            grace_period = self.config.timeouts.watchdog_grace_seconds
+
+            start_time = time.monotonic()
+            killed_by_watchdog = False
+
+            # Poll loop with watchdog check
+            while process.poll() is None:
+                elapsed = time.monotonic() - start_time
+
+                # Check subprocess timeout (fallback)
+                if elapsed > subprocess_timeout:
+                    logger.warning(
+                        f"Watchdog: Subprocess timeout after {self.config.timeouts.subprocess_timeout_minutes} minutes"
+                    )
+                    process.kill()
+                    killed_by_watchdog = True
+                    break
+
+                # Check if fatal error was detected
+                if fatal_error_detected.is_set() and not killed_by_watchdog:
+                    logger.warning(
+                        f"Watchdog: Fatal error detected, waiting {grace_period}s grace period..."
+                    )
+                    # Wait grace period for process to exit naturally
+                    try:
+                        process.wait(timeout=grace_period)
+                        logger.info("Watchdog: Process exited during grace period")
+                    except subprocess.TimeoutExpired:
+                        logger.error(
+                            f"Watchdog: Process did not exit after {grace_period}s grace period, killing"
+                        )
+                        process.kill()
+                        killed_by_watchdog = True
+                    break
+
+                # Short sleep to avoid busy-waiting
+                time.sleep(0.5)
+
+            # Wait for process to fully terminate
+            returncode = process.wait()
+
+            if killed_by_watchdog:
                 returncode = -1
+
         except Exception:
             # Ensure process is terminated if an error occurs
             if process is not None:
@@ -638,17 +757,24 @@ class Worker:
                     pass
             raise
         finally:
-            # Always close file handles
+            # Signal monitor thread to stop and close file handles
+            monitor_stop.set()
+
             if stdout_file is not None:
                 try:
                     stdout_file.close()
                 except Exception:
                     pass
-            if stderr_file is not None:
+
+            if stderr_read_fd is not None:
                 try:
-                    stderr_file.close()
+                    os.close(stderr_read_fd)
                 except Exception:
                     pass
+
+            # Wait briefly for monitor thread to finish
+            if "monitor_thread" in dir() and monitor_thread.is_alive():
+                monitor_thread.join(timeout=2.0)
 
         return returncode
 

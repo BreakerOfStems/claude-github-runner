@@ -141,6 +141,21 @@ timeouts:
   # Default: 60 (1 hour)
   run_timeout_minutes: 60
 
+  # Subprocess timeout (minutes)
+  # Fallback timeout for the Claude subprocess.
+  # If the process doesn't exit within this time, it is killed.
+  # Should be less than run_timeout_minutes to allow for cleanup.
+  # Default: 55 (55 minutes)
+  subprocess_timeout_minutes: 55
+
+  # Watchdog grace period (seconds)
+  # When a fatal error pattern is detected in stderr (e.g., unhandled promise
+  # rejection), the watchdog waits this long for the process to exit cleanly
+  # before killing it. This handles hung Claude processes that emit errors
+  # but don't exit.
+  # Default: 10
+  watchdog_grace_seconds: 10
+
   # Stale run threshold (minutes)
   # Runs older than this are considered stale during the `reap` command.
   # Stale runs are terminated and marked as failed.
