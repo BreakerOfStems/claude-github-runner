@@ -10,12 +10,11 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
 
 from .config import Config
-from .database import Database, Run, RunStatus, JobType
+from .database import Database, JobType, Run, RunStatus
 from .discovery import Discovery, Job
-from .github import GitHub, GitHubError
+from .github import GitHub
 from .worker import Worker
 from .workspace import Workspace
 
@@ -44,7 +43,7 @@ def is_pid_alive(pid: int) -> bool:
 class Runner:
     """Main runner orchestrator."""
 
-    def __init__(self, config_path: Optional[str] = None):
+    def __init__(self, config_path: str | None = None):
         self.config = Config.load(config_path)
         self.db = Database(self.config.paths.db_path)
         self.github = GitHub(
@@ -96,24 +95,28 @@ class Runner:
                 # Use execute_async which forks and runs in background
                 # This creates the DB record, forks, and returns immediately
                 run_id = self.worker.execute_async(job)
-                results.append({
-                    "job": f"{job.repo}#{job.target_number}",
-                    "run_id": run_id,
-                    "status": "started",
-                })
+                results.append(
+                    {
+                        "job": f"{job.repo}#{job.target_number}",
+                        "run_id": run_id,
+                        "status": "started",
+                    }
+                )
             except Exception as e:
                 logger.exception(f"Failed to execute job {job.repo}#{job.target_number}: {e}")
-                results.append({
-                    "job": f"{job.repo}#{job.target_number}",
-                    "status": "failed",
-                    "error": str(e),
-                })
+                results.append(
+                    {
+                        "job": f"{job.repo}#{job.target_number}",
+                        "status": "failed",
+                        "error": str(e),
+                    }
+                )
 
         logger.info(f"Tick complete: {len(results)} jobs processed")
         return {"status": "ok", "jobs": results}
 
     def run_single(
-        self, repo: str, number: int, comment_id: Optional[int] = None, run_id: Optional[str] = None
+        self, repo: str, number: int, comment_id: int | None = None, run_id: str | None = None
     ) -> str:
         """Execute a single job manually or as spawned worker."""
         logger.info(f"Run for {repo}#{number}" + (f" (run_id={run_id})" if run_id else " (manual)"))
@@ -156,7 +159,9 @@ class Runner:
         """Detect dead PIDs and mark stale runs.
 
         Also attempts to reap any zombie processes that may have accumulated
-        if SIGCHLD handling was not properly configured.
+        if SIGCHLD handling was not properly configured. Before marking runs as
+        failed, checks for orphaned PRs that may have been created by Claude
+        before the crash.
         """
         logger.info("Starting reap")
 
@@ -164,6 +169,7 @@ class Runner:
             "dead_pids": [],
             "stale_runs": [],
             "reaped_zombies": [],
+            "recovered_prs": [],
         }
 
         # First, try to reap any zombie processes (non-blocking)
@@ -184,6 +190,18 @@ class Runner:
         for run in running_runs:
             if run.pid and not is_pid_alive(run.pid):
                 logger.warning(f"Run {run.run_id} has dead PID {run.pid}")
+
+                # Check for orphaned PRs before marking as failed
+                recovered_pr = self._check_and_recover_orphan_pr(run)
+                if recovered_pr:
+                    results["recovered_prs"].append(
+                        {
+                            "run_id": run.run_id,
+                            "pr_url": recovered_pr,
+                        }
+                    )
+                    continue  # Skip marking as failed
+
                 self.db.update_run_status(
                     run.run_id,
                     RunStatus.FAILED,
@@ -193,7 +211,9 @@ class Runner:
 
                 # Try to release GitHub claim
                 try:
-                    self.github.remove_label(run.repo, run.target_number, self.config.labels.in_progress)
+                    self.github.remove_label(
+                        run.repo, run.target_number, self.config.labels.in_progress
+                    )
                     login = self.github.get_authenticated_user()
                     self.github.unassign_issue(run.repo, run.target_number, login)
                 except Exception as e:
@@ -204,6 +224,24 @@ class Runner:
         for run in stale_runs:
             if run.run_id not in results["dead_pids"]:  # Don't double-count
                 logger.warning(f"Run {run.run_id} is stale (started at {run.started_at})")
+
+                # Check for orphaned PRs before marking as failed
+                recovered_pr = self._check_and_recover_orphan_pr(run)
+                if recovered_pr:
+                    results["recovered_prs"].append(
+                        {
+                            "run_id": run.run_id,
+                            "pr_url": recovered_pr,
+                        }
+                    )
+                    # Still kill the process if alive
+                    if run.pid and is_pid_alive(run.pid):
+                        try:
+                            os.kill(run.pid, 9)
+                        except Exception:
+                            pass
+                    continue  # Skip marking as failed
+
                 self.db.update_run_status(
                     run.run_id,
                     RunStatus.FAILED,
@@ -220,7 +258,9 @@ class Runner:
 
                 # Release GitHub claim
                 try:
-                    self.github.remove_label(run.repo, run.target_number, self.config.labels.in_progress)
+                    self.github.remove_label(
+                        run.repo, run.target_number, self.config.labels.in_progress
+                    )
                     login = self.github.get_authenticated_user()
                     self.github.unassign_issue(run.repo, run.target_number, login)
                 except Exception as e:
@@ -229,11 +269,66 @@ class Runner:
         # Clean up old workspaces
         self.workspace_manager.cleanup_old_workspaces()
 
+        log_parts = [
+            f"{len(results['dead_pids'])} dead PIDs",
+            f"{len(results['stale_runs'])} stale runs",
+        ]
         if results["reaped_zombies"]:
-            logger.info(f"Reap complete: {len(results['dead_pids'])} dead PIDs, {len(results['stale_runs'])} stale runs, {len(results['reaped_zombies'])} zombies reaped")
-        else:
-            logger.info(f"Reap complete: {len(results['dead_pids'])} dead PIDs, {len(results['stale_runs'])} stale runs")
+            log_parts.append(f"{len(results['reaped_zombies'])} zombies reaped")
+        if results["recovered_prs"]:
+            log_parts.append(f"{len(results['recovered_prs'])} PRs recovered")
+        logger.info(f"Reap complete: {', '.join(log_parts)}")
         return results
+
+    def _check_and_recover_orphan_pr(self, run: Run) -> str | None:
+        """Check for and recover an orphaned PR for a run.
+
+        Args:
+            run: The run to check for orphaned PRs
+
+        Returns:
+            PR URL if recovered, None otherwise
+        """
+        try:
+            # Look for PRs with our branch naming pattern
+            branch_prefix = self.config.branching.branch_prefix
+            matching_prs = self.github.find_prs_by_branch_pattern(
+                run.repo, branch_prefix, run.target_number, state="open"
+            )
+
+            if not matching_prs:
+                return None
+
+            # Found a matching PR - recover it
+            pr = matching_prs[0]
+            logger.info(f"Found orphaned PR for {run.repo}#{run.target_number}: {pr.url}")
+
+            # Update database with the recovered PR URL
+            self.db.update_run_status(run.run_id, RunStatus.SUCCEEDED, pr_url=pr.url)
+
+            # Update GitHub state
+            try:
+                self.github.remove_label(
+                    run.repo, run.target_number, self.config.labels.in_progress
+                )
+
+                # Post recovery comment
+                self.github.create_comment(
+                    run.repo,
+                    run.target_number,
+                    f"🤖 **Recovery Notice**: I found a PR that was created but not properly recorded "
+                    f"due to a process interruption: {pr.url}\n\n"
+                    f"The PR is ready for review. This run has been marked as completed.\n\n"
+                    f"`Run ID: {run.run_id}`",
+                )
+            except Exception as e:
+                logger.warning(f"Failed to update GitHub during PR recovery: {e}")
+
+            return pr.url
+
+        except Exception as e:
+            logger.warning(f"Error checking for orphaned PRs: {e}")
+            return None
 
     def _get_available_slots(self) -> int:
         """Calculate available concurrency slots."""
@@ -293,7 +388,7 @@ class Daemon:
     - Properly inherits the process environment to Claude Code subprocesses
     """
 
-    def __init__(self, config_path: Optional[str] = None):
+    def __init__(self, config_path: str | None = None):
         self.config_path = config_path
         self.config = Config.load(config_path)
         self.db = Database(self.config.paths.db_path)
@@ -305,16 +400,18 @@ class Daemon:
         self.discovery = Discovery(self.config, self.db, self.github)
 
         # In-memory tracking of running processes
-        self.running_jobs: Dict[str, RunningJob] = {}
+        self.running_jobs: dict[str, RunningJob] = {}
 
         # Shutdown flag
         self._shutdown = False
 
-    def run(self, poll_interval: Optional[int] = None):
+    def run(self, poll_interval: int | None = None):
         """Main daemon loop."""
         interval = poll_interval or self.config.polling.interval_seconds
 
-        logger.info(f"Starting daemon with {interval}s poll interval, max_concurrency={self.config.polling.max_concurrency}")
+        logger.info(
+            f"Starting daemon with {interval}s poll interval, max_concurrency={self.config.polling.max_concurrency}"
+        )
 
         # Set up signal handlers for graceful shutdown
         signal.signal(signal.SIGTERM, self._handle_shutdown)
@@ -381,7 +478,9 @@ class Daemon:
         # Atomically claim the job first to prevent race conditions
         # This must happen BEFORE marking comments processed to avoid orphaned records
         if not self.db.claim_job(run_id, job.repo, job.target_number, job.job_type):
-            logger.info(f"Job {job.repo}#{job.target_number} already claimed by another run, skipping")
+            logger.info(
+                f"Job {job.repo}#{job.target_number} already claimed by another run, skipping"
+            )
             return
 
         logger.info(f"Successfully claimed job {job.repo}#{job.target_number}")
@@ -396,11 +495,16 @@ class Daemon:
 
         # Build the cgr run command
         cmd = [
-            sys.executable, "-m", "claude_github_runner",
+            sys.executable,
+            "-m",
+            "claude_github_runner",
             "run",
-            "--repo", job.repo,
-            "--number", str(job.target_number),
-            "--run-id", run_id,
+            "--repo",
+            job.repo,
+            "--number",
+            str(job.target_number),
+            "--run-id",
+            run_id,
         ]
 
         if job.comment:
@@ -442,7 +546,11 @@ class Daemon:
         logger.info(f"Started run {run_id} with PID {process.pid}")
 
     def _reap_completed(self):
-        """Check for and handle completed processes."""
+        """Check for and handle completed processes.
+
+        Before marking crashed runs as failed, checks for orphaned PRs that
+        may have been created by Claude before the crash.
+        """
         completed = []
 
         for run_id, running_job in self.running_jobs.items():
@@ -459,18 +567,27 @@ class Daemon:
                     run = self.db.get_run(run_id)
                     if run and run.status == RunStatus.RUNNING:
                         # Run command crashed before updating status
-                        self.db.update_run_status(
-                            run_id,
-                            RunStatus.FAILED,
-                            error=f"Worker process exited with code {returncode}"
-                        )
-                        self._release_github_claim(running_job.job)
+                        # Check for orphaned PRs before marking as failed
+                        recovered_pr = self._check_and_recover_orphan_pr(run)
+                        if recovered_pr:
+                            logger.info(f"Recovered orphaned PR for run {run_id}: {recovered_pr}")
+                        else:
+                            self.db.update_run_status(
+                                run_id,
+                                RunStatus.FAILED,
+                                error=f"Worker process exited with code {returncode}",
+                            )
+                            self._release_github_claim(running_job.job)
 
         for run_id in completed:
             del self.running_jobs[run_id]
 
     def _cleanup_stale_runs(self):
-        """Clean up stale runs from DB (from previous daemon instances)."""
+        """Clean up stale runs from DB (from previous daemon instances).
+
+        Before marking stale runs as failed, checks for orphaned PRs that
+        may have been created by Claude before the timeout.
+        """
         stale_runs = self.db.get_stale_runs(self.config.timeouts.stale_run_minutes)
 
         for run in stale_runs:
@@ -489,16 +606,24 @@ class Daemon:
                 except Exception:
                     pass
 
+            # Check for orphaned PRs before marking as failed
+            recovered_pr = self._check_and_recover_orphan_pr(run)
+            if recovered_pr:
+                logger.info(f"Recovered orphaned PR for stale run {run.run_id}: {recovered_pr}")
+                continue  # Skip marking as failed
+
             logger.warning(f"Marking stale run {run.run_id} as failed")
             self.db.update_run_status(
                 run.run_id,
                 RunStatus.FAILED,
-                error=f"Run timed out after {self.config.timeouts.stale_run_minutes} minutes"
+                error=f"Run timed out after {self.config.timeouts.stale_run_minutes} minutes",
             )
 
             # Release GitHub claim
             try:
-                self.github.remove_label(run.repo, run.target_number, self.config.labels.in_progress)
+                self.github.remove_label(
+                    run.repo, run.target_number, self.config.labels.in_progress
+                )
                 login = self.github.get_authenticated_user()
                 self.github.unassign_issue(run.repo, run.target_number, login)
             except Exception as e:
@@ -511,7 +636,62 @@ class Daemon:
             login = self.github.get_authenticated_user()
             self.github.unassign_issue(job.repo, job.target_number, login)
         except Exception as e:
-            logger.warning(f"Failed to release GitHub claim for {job.repo}#{job.target_number}: {e}")
+            logger.warning(
+                f"Failed to release GitHub claim for {job.repo}#{job.target_number}: {e}"
+            )
+
+    def _check_and_recover_orphan_pr(self, run: Run) -> str | None:
+        """Check for and recover an orphaned PR for a run.
+
+        This handles the case where Claude Code crashes after creating a PR but
+        before the worker can capture the completion state.
+
+        Args:
+            run: The run to check for orphaned PRs
+
+        Returns:
+            PR URL if recovered, None otherwise
+        """
+        try:
+            # Look for PRs with our branch naming pattern
+            branch_prefix = self.config.branching.branch_prefix
+            matching_prs = self.github.find_prs_by_branch_pattern(
+                run.repo, branch_prefix, run.target_number, state="open"
+            )
+
+            if not matching_prs:
+                return None
+
+            # Found a matching PR - recover it
+            pr = matching_prs[0]
+            logger.info(f"Found orphaned PR for {run.repo}#{run.target_number}: {pr.url}")
+
+            # Update database with the recovered PR URL
+            self.db.update_run_status(run.run_id, RunStatus.SUCCEEDED, pr_url=pr.url)
+
+            # Update GitHub state
+            try:
+                self.github.remove_label(
+                    run.repo, run.target_number, self.config.labels.in_progress
+                )
+
+                # Post recovery comment
+                self.github.create_comment(
+                    run.repo,
+                    run.target_number,
+                    f"🤖 **Recovery Notice**: I found a PR that was created but not properly recorded "
+                    f"due to a process interruption: {pr.url}\n\n"
+                    f"The PR is ready for review. This run has been marked as completed.\n\n"
+                    f"`Run ID: {run.run_id}`",
+                )
+            except Exception as e:
+                logger.warning(f"Failed to update GitHub during PR recovery: {e}")
+
+            return pr.url
+
+        except Exception as e:
+            logger.warning(f"Error checking for orphaned PRs: {e}")
+            return None
 
     def _wait_for_jobs(self, timeout: int = 60):
         """Wait for running jobs to complete during shutdown."""
@@ -541,12 +721,14 @@ def main():
         description="Headless GitHub automation service powered by Claude",
     )
     parser.add_argument(
-        "-c", "--config",
+        "-c",
+        "--config",
         help="Path to config file",
         default=None,
     )
     parser.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         help="Enable verbose logging",
         action="store_true",
     )
@@ -680,7 +862,7 @@ def main():
                 sys.stdout.write("\033[?1006l\033[?1003l\033[?1000l\033[?25h\033[0m")
                 sys.stdout.flush()
         except ImportError as e:
-            print(f"Error: UI requires 'textual' package. Install with: pip install textual")
+            print("Error: UI requires 'textual' package. Install with: pip install textual")
             print(f"Details: {e}")
             sys.exit(1)
         except KeyboardInterrupt:
@@ -721,6 +903,7 @@ def main():
         elif args.command == "status":
             result = runner.status()
             import json
+
             print(json.dumps(result, indent=2))
 
         elif args.command == "logs":
@@ -748,7 +931,7 @@ def main():
                     print(f"Error: {run.error}")
                 if run.stderr_output:
                     stderr_size = len(run.stderr_output)
-                    stderr_lines = run.stderr_output.count('\n') + 1
+                    stderr_lines = run.stderr_output.count("\n") + 1
                     print(f"\nStderr captured: {stderr_size} bytes, {stderr_lines} lines")
                     print("Use --stderr flag to view full stderr output")
 

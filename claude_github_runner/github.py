@@ -4,10 +4,11 @@ import json
 import logging
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Callable, Optional, TypeVar
+from typing import TypeVar
 
 from .config import CircuitBreakerConfig
 
@@ -18,6 +19,7 @@ T = TypeVar("T")
 
 class CircuitState(Enum):
     """States for the circuit breaker."""
+
     CLOSED = "closed"  # Normal operation, requests pass through
     OPEN = "open"  # Circuit is tripped, requests are blocked
     HALF_OPEN = "half_open"  # Testing if service recovered
@@ -25,6 +27,7 @@ class CircuitState(Enum):
 
 class CircuitBreakerError(Exception):
     """Error raised when circuit breaker is open."""
+
     pass
 
 
@@ -44,7 +47,7 @@ class CircuitBreaker:
         self.config = config
         self._state = CircuitState.CLOSED
         self._failure_count = 0
-        self._last_failure_time: Optional[float] = None
+        self._last_failure_time: float | None = None
         self._half_open_calls = 0
         self._recovery_timeout = config.recovery_timeout_seconds
         self._open_count = 0  # Track how many times circuit has opened
@@ -65,7 +68,9 @@ class CircuitBreaker:
 
     def _transition_to_half_open(self):
         """Transition from OPEN to HALF_OPEN state."""
-        logger.info(f"Circuit breaker transitioning to HALF_OPEN after {self._recovery_timeout}s cooldown")
+        logger.info(
+            f"Circuit breaker transitioning to HALF_OPEN after {self._recovery_timeout}s cooldown"
+        )
         self._state = CircuitState.HALF_OPEN
         self._half_open_calls = 0
 
@@ -74,7 +79,8 @@ class CircuitBreaker:
         self._open_count += 1
         # Apply exponential backoff to recovery timeout
         self._recovery_timeout = self.config.recovery_timeout_seconds * (
-            self.config.backoff_multiplier ** min(self._open_count - 1, 5)  # Cap backoff at 5 doublings
+            self.config.backoff_multiplier
+            ** min(self._open_count - 1, 5)  # Cap backoff at 5 doublings
         )
         logger.warning(
             f"Circuit breaker OPEN after {self._failure_count} failures. "
@@ -125,7 +131,7 @@ class CircuitBreaker:
             return True
         return False
 
-    def execute(self, func: Callable[[], T], fallback: Optional[Callable[[], T]] = None) -> T:
+    def execute(self, func: Callable[[], T], fallback: Callable[[], T] | None = None) -> T:
         """Execute a function through the circuit breaker.
 
         Args:
@@ -150,7 +156,7 @@ class CircuitBreaker:
             result = func()
             self.record_success()
             return result
-        except Exception as e:
+        except Exception:
             self.record_failure()
             raise
 
@@ -188,6 +194,7 @@ class PullRequest:
 
 class GitHubError(Exception):
     """Error interacting with GitHub."""
+
     pass
 
 
@@ -195,21 +202,26 @@ class GitHub:
     """GitHub API wrapper using gh CLI."""
 
     # Shared circuit breaker instance across all GitHub instances
-    _circuit_breaker: Optional[CircuitBreaker] = None
-    _circuit_breaker_config: Optional[CircuitBreakerConfig] = None
+    _circuit_breaker: CircuitBreaker | None = None
+    _circuit_breaker_config: CircuitBreakerConfig | None = None
 
     DEFAULT_TIMEOUT_SECONDS = 30
 
     def __init__(
         self,
-        circuit_breaker_config: Optional[CircuitBreakerConfig] = None,
-        timeout_seconds: Optional[int] = None,
+        circuit_breaker_config: CircuitBreakerConfig | None = None,
+        timeout_seconds: int | None = None,
     ):
-        self._login: Optional[str] = None
-        self._timeout = timeout_seconds if timeout_seconds is not None else self.DEFAULT_TIMEOUT_SECONDS
+        self._login: str | None = None
+        self._timeout = (
+            timeout_seconds if timeout_seconds is not None else self.DEFAULT_TIMEOUT_SECONDS
+        )
         # Initialize or update circuit breaker if config provided
         if circuit_breaker_config is not None:
-            if GitHub._circuit_breaker is None or GitHub._circuit_breaker_config != circuit_breaker_config:
+            if (
+                GitHub._circuit_breaker is None
+                or GitHub._circuit_breaker_config != circuit_breaker_config
+            ):
                 GitHub._circuit_breaker_config = circuit_breaker_config
                 GitHub._circuit_breaker = CircuitBreaker(circuit_breaker_config)
         # Use default config if no circuit breaker exists
@@ -287,14 +299,22 @@ class GitHub:
         """Search for ready issues in a repository."""
         # Use gh search with flags instead of query string (more reliable)
         args = [
-            "search", "issues",
-            "--repo", repo,
-            "--state", "open",
-            "--label", ready_label,
-            "--json", "number,title,body,labels,assignees,createdAt,url",
-            "--sort", "created",
-            "--order", "asc" if oldest_first else "desc",
-            "--limit", "100",
+            "search",
+            "issues",
+            "--repo",
+            repo,
+            "--state",
+            "open",
+            "--label",
+            ready_label,
+            "--json",
+            "number,title,body,labels,assignees,createdAt,url",
+            "--sort",
+            "created",
+            "--order",
+            "asc" if oldest_first else "desc",
+            "--limit",
+            "100",
         ]
 
         result = self._run_gh(args, check=False)
@@ -333,15 +353,17 @@ class GitHub:
             if assignees:
                 continue
 
-            issues.append(Issue(
-                number=item["number"],
-                title=item["title"],
-                body=item.get("body") or "",
-                labels=labels,
-                assignees=assignees,
-                created_at=datetime.fromisoformat(item["createdAt"].replace("Z", "+00:00")),
-                url=item["url"],
-            ))
+            issues.append(
+                Issue(
+                    number=item["number"],
+                    title=item["title"],
+                    body=item.get("body") or "",
+                    labels=labels,
+                    assignees=assignees,
+                    created_at=datetime.fromisoformat(item["createdAt"].replace("Z", "+00:00")),
+                    url=item["url"],
+                )
+            )
 
         return issues
 
@@ -349,7 +371,7 @@ class GitHub:
         self,
         repo: str,
         login: str,
-        since: Optional[datetime] = None,
+        since: datetime | None = None,
     ) -> list[int]:
         """Search for issues/PRs that mention the user since last poll."""
         # Use gh api to search directly - avoids CLI quoting issues
@@ -360,13 +382,21 @@ class GitHub:
 
         query = " ".join(query_parts)
 
-        result = self._run_gh([
-            "api", "search/issues",
-            "-X", "GET",
-            "-f", f"q={query}",
-            "-f", "per_page=100",
-            "--jq", ".items[].number",
-        ], check=False)
+        result = self._run_gh(
+            [
+                "api",
+                "search/issues",
+                "-X",
+                "GET",
+                "-f",
+                f"q={query}",
+                "-f",
+                "per_page=100",
+                "--jq",
+                ".items[].number",
+            ],
+            check=False,
+        )
 
         if result.returncode != 0:
             logger.warning(f"Mention search failed: {result.stderr}")
@@ -384,10 +414,12 @@ class GitHub:
 
     def get_issue(self, repo: str, number: int) -> Issue:
         """Get a single issue or PR."""
-        result = self._run_gh([
-            "api",
-            f"repos/{repo}/issues/{number}",
-        ])
+        result = self._run_gh(
+            [
+                "api",
+                f"repos/{repo}/issues/{number}",
+            ]
+        )
 
         data = json.loads(result.stdout)
 
@@ -404,11 +436,13 @@ class GitHub:
 
     def get_issue_comments(self, repo: str, number: int) -> list[Comment]:
         """Get comments on an issue or PR."""
-        result = self._run_gh([
-            "api",
-            f"repos/{repo}/issues/{number}/comments",
-            "--paginate",
-        ])
+        result = self._run_gh(
+            [
+                "api",
+                f"repos/{repo}/issues/{number}/comments",
+                "--paginate",
+            ]
+        )
 
         if not result.stdout.strip():
             return []
@@ -421,13 +455,15 @@ class GitHub:
 
         comments = []
         for item in data:
-            comments.append(Comment(
-                id=item["id"],
-                body=item.get("body") or "",
-                author=item["user"]["login"],
-                url=item["html_url"],
-                created_at=datetime.fromisoformat(item["created_at"].replace("Z", "+00:00")),
-            ))
+            comments.append(
+                Comment(
+                    id=item["id"],
+                    body=item.get("body") or "",
+                    author=item["user"]["login"],
+                    url=item["html_url"],
+                    created_at=datetime.fromisoformat(item["created_at"].replace("Z", "+00:00")),
+                )
+            )
 
         return comments
 
@@ -437,12 +473,16 @@ class GitHub:
         Returns True if successful, False otherwise.
         """
         try:
-            self._run_gh([
-                "api",
-                "-X", "POST",
-                f"repos/{repo}/issues/{number}/labels",
-                "-f", f"labels[]={label}",
-            ])
+            self._run_gh(
+                [
+                    "api",
+                    "-X",
+                    "POST",
+                    f"repos/{repo}/issues/{number}/labels",
+                    "-f",
+                    f"labels[]={label}",
+                ]
+            )
             return True
         except GitHubError as e:
             logger.warning(f"Failed to add label '{label}' to {repo}#{number}: {e}")
@@ -455,18 +495,24 @@ class GitHub:
         """
         # URL encode the label name for the path
         encoded_label = label.replace(" ", "%20")
-        result = self._run_gh([
-            "api",
-            "-X", "DELETE",
-            f"repos/{repo}/issues/{number}/labels/{encoded_label}",
-        ], check=False)  # Don't fail if label doesn't exist
+        result = self._run_gh(
+            [
+                "api",
+                "-X",
+                "DELETE",
+                f"repos/{repo}/issues/{number}/labels/{encoded_label}",
+            ],
+            check=False,
+        )  # Don't fail if label doesn't exist
 
         if result.returncode != 0:
             # 404 is expected if label doesn't exist - treat as success
             if "404" in result.stderr or "Not Found" in result.stderr:
                 logger.debug(f"Label '{label}' not found on {repo}#{number} (already removed)")
                 return True
-            logger.warning(f"Failed to remove label '{label}' from {repo}#{number}: {result.stderr}")
+            logger.warning(
+                f"Failed to remove label '{label}' from {repo}#{number}: {result.stderr}"
+            )
             return False
         return True
 
@@ -476,12 +522,16 @@ class GitHub:
         Returns True if successful, False otherwise.
         """
         try:
-            self._run_gh([
-                "api",
-                "-X", "POST",
-                f"repos/{repo}/issues/{number}/assignees",
-                "-f", f"assignees[]={assignee}",
-            ])
+            self._run_gh(
+                [
+                    "api",
+                    "-X",
+                    "POST",
+                    f"repos/{repo}/issues/{number}/assignees",
+                    "-f",
+                    f"assignees[]={assignee}",
+                ]
+            )
             return True
         except GitHubError as e:
             logger.warning(f"Failed to assign '{assignee}' to {repo}#{number}: {e}")
@@ -492,12 +542,17 @@ class GitHub:
 
         Returns True if successful, False otherwise.
         """
-        result = self._run_gh([
-            "api",
-            "-X", "DELETE",
-            f"repos/{repo}/issues/{number}/assignees",
-            "-f", f"assignees[]={assignee}",
-        ], check=False)
+        result = self._run_gh(
+            [
+                "api",
+                "-X",
+                "DELETE",
+                f"repos/{repo}/issues/{number}/assignees",
+                "-f",
+                f"assignees[]={assignee}",
+            ],
+            check=False,
+        )
 
         if result.returncode != 0:
             logger.warning(f"Failed to unassign '{assignee}' from {repo}#{number}: {result.stderr}")
@@ -510,12 +565,16 @@ class GitHub:
         Returns True if successful, False otherwise.
         """
         try:
-            self._run_gh([
-                "api",
-                "-X", "POST",
-                f"repos/{repo}/issues/{number}/comments",
-                "-f", f"body={body}",
-            ])
+            self._run_gh(
+                [
+                    "api",
+                    "-X",
+                    "POST",
+                    f"repos/{repo}/issues/{number}/comments",
+                    "-f",
+                    f"body={body}",
+                ]
+            )
             return True
         except GitHubError as e:
             logger.warning(f"Failed to create comment on {repo}#{number}: {e}")
@@ -523,11 +582,14 @@ class GitHub:
 
     def clone_repo(self, repo: str, target_dir: str):
         """Clone a repository."""
-        self._run_gh([
-            "repo", "clone",
-            repo,
-            target_dir,
-        ])
+        self._run_gh(
+            [
+                "repo",
+                "clone",
+                repo,
+                target_dir,
+            ]
+        )
 
     def create_pr(
         self,
@@ -540,12 +602,19 @@ class GitHub:
     ) -> str:
         """Create a pull request. Returns the PR URL."""
         cmd = [
-            "gh", "pr", "create",
-            "--repo", repo,
-            "--title", title,
-            "--body", body,
-            "--head", head_branch,
-            "--base", base_branch,
+            "gh",
+            "pr",
+            "create",
+            "--repo",
+            repo,
+            "--title",
+            title,
+            "--body",
+            body,
+            "--head",
+            head_branch,
+            "--base",
+            base_branch,
         ]
 
         def execute_pr_create() -> str:
@@ -568,15 +637,23 @@ class GitHub:
         else:
             return execute_pr_create()
 
-    def get_pr_for_branch(self, repo: str, branch: str) -> Optional[PullRequest]:
+    def get_pr_for_branch(self, repo: str, branch: str) -> PullRequest | None:
         """Get PR for a branch if it exists."""
-        result = self._run_gh([
-            "pr", "list",
-            "--repo", repo,
-            "--head", branch,
-            "--json", "number,title,body,url,headRefName,baseRefName",
-            "--limit", "1",
-        ], check=False)
+        result = self._run_gh(
+            [
+                "pr",
+                "list",
+                "--repo",
+                repo,
+                "--head",
+                branch,
+                "--json",
+                "number,title,body,url,headRefName,baseRefName",
+                "--limit",
+                "1",
+            ],
+            check=False,
+        )
 
         if result.returncode != 0 or not result.stdout.strip():
             return None
@@ -598,7 +675,74 @@ class GitHub:
         except (json.JSONDecodeError, KeyError, IndexError):
             return None
 
-    def update_pr(self, repo: str, number: int, title: Optional[str] = None, body: Optional[str] = None):
+    def find_prs_by_branch_pattern(
+        self, repo: str, branch_prefix: str, issue_number: int, state: str = "open"
+    ) -> list[PullRequest]:
+        """Find PRs with branches matching a pattern for a specific issue.
+
+        This is used to detect "orphaned" PRs - those created by Claude but not
+        recorded due to a crash. The pattern matches branches like:
+        - claude/42-fix-bug
+        - claude/42-implement-feature
+
+        Args:
+            repo: Repository in owner/repo format
+            branch_prefix: Branch prefix (e.g., "claude")
+            issue_number: The issue number to search for in branch names
+            state: PR state filter ("open", "closed", "all")
+
+        Returns:
+            List of matching PullRequests
+        """
+        # List all PRs and filter by branch pattern
+        # The gh CLI doesn't support wildcards in --head, so we fetch all and filter
+        result = self._run_gh(
+            [
+                "pr",
+                "list",
+                "--repo",
+                repo,
+                "--state",
+                state,
+                "--json",
+                "number,title,body,url,headRefName,baseRefName",
+                "--limit",
+                "100",
+            ],
+            check=False,
+        )
+
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+
+        try:
+            data = json.loads(result.stdout)
+            if not data:
+                return []
+
+            # Filter for branches matching pattern: {prefix}/{issue_number}-*
+            pattern_prefix = f"{branch_prefix}/{issue_number}-"
+            matching_prs = []
+
+            for item in data:
+                head_branch = item.get("headRefName", "")
+                if head_branch.startswith(pattern_prefix):
+                    matching_prs.append(
+                        PullRequest(
+                            number=item["number"],
+                            title=item["title"],
+                            body=item.get("body") or "",
+                            url=item["url"],
+                            head_branch=head_branch,
+                            base_branch=item["baseRefName"],
+                        )
+                    )
+
+            return matching_prs
+        except (json.JSONDecodeError, KeyError):
+            return []
+
+    def update_pr(self, repo: str, number: int, title: str | None = None, body: str | None = None):
         """Update a pull request."""
         args = ["pr", "edit", str(number), "--repo", repo]
 
@@ -618,11 +762,15 @@ class GitHub:
 
         Returns list of label names, or empty list on error.
         """
-        result = self._run_gh([
-            "api",
-            f"repos/{repo}/issues/{number}/labels",
-            "--jq", ".[].name",
-        ], check=False)
+        result = self._run_gh(
+            [
+                "api",
+                f"repos/{repo}/issues/{number}/labels",
+                "--jq",
+                ".[].name",
+            ],
+            check=False,
+        )
 
         if result.returncode != 0:
             logger.warning(f"Failed to get labels for {repo}#{number}: {result.stderr}")
