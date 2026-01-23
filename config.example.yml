@@ -312,6 +312,25 @@ retry:
   # Default: 2.0
   backoff_multiplier: 2.0
 
+# ----------------------------------------------------------------------------
+# GIT IDENTITY SETTINGS
+# ----------------------------------------------------------------------------
+# Configure git identity used for commits made by the runner.
+# This identity is configured locally in each workspace after cloning,
+# ensuring commits don't fail due to missing global git config.
+#
+git:
+  # Git user name for commits
+  # This appears as the commit author name.
+  # Default: "claude-github-runner"
+  user_name: "claude-github-runner"
+
+  # Git user email for commits
+  # This appears as the commit author email.
+  # Using a noreply address is recommended to avoid exposing real emails.
+  # Default: "claude-github-runner@users.noreply.github.com"
+  user_email: "claude-github-runner@users.noreply.github.com"
+
 # ============================================================================
 # COMMON CONFIGURATIONS
 # ============================================================================
