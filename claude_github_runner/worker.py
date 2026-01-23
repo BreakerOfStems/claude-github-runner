@@ -285,6 +285,9 @@ class Worker:
 
         git = Git(paths.repo)
 
+        # Configure git identity for commits in this workspace
+        git.setup_identity(self.config.git.user_name, self.config.git.user_email)
+
         # Determine base branch - use config override or auto-detect from repo
         base_branch = self._determine_base_branch(job.repo)
 

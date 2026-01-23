@@ -81,6 +81,12 @@ class CleanupConfig:
 
 
 @dataclass
+class GitConfig:
+    user_name: str = "claude-github-runner"
+    user_email: str = "claude-github-runner@users.noreply.github.com"
+
+
+@dataclass
 class Config:
     repos: list[str] = field(default_factory=list)
     labels: LabelsConfig = field(default_factory=LabelsConfig)
@@ -93,6 +99,7 @@ class Config:
     cleanup: CleanupConfig = field(default_factory=CleanupConfig)
     retry: RetryConfig = field(default_factory=RetryConfig)
     circuit_breaker: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
+    git: GitConfig = field(default_factory=GitConfig)
     _config_path: Optional[str] = field(default=None, repr=False)  # Track source config path for spawned workers
 
     @classmethod
@@ -183,6 +190,13 @@ class Config:
                 recovery_timeout_seconds=cb.get("recovery_timeout_seconds", config.circuit_breaker.recovery_timeout_seconds),
                 half_open_max_calls=cb.get("half_open_max_calls", config.circuit_breaker.half_open_max_calls),
                 backoff_multiplier=cb.get("backoff_multiplier", config.circuit_breaker.backoff_multiplier),
+            )
+
+        if "git" in data:
+            git_data = data["git"]
+            config.git = GitConfig(
+                user_name=git_data.get("user_name", config.git.user_name),
+                user_email=git_data.get("user_email", config.git.user_email),
             )
 
         return config

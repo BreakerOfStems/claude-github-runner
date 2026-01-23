@@ -147,6 +147,12 @@ class Git:
     def __init__(self, repo_path: Path):
         self.repo_path = repo_path
 
+    def setup_identity(self, user_name: str, user_email: str):
+        """Configure git identity for commits in this workspace."""
+        self._run(["config", "user.name", user_name])
+        self._run(["config", "user.email", user_email])
+        logger.debug(f"Configured git identity: {user_name} <{user_email}>")
+
     def _run(self, args: list[str], check: bool = True) -> subprocess.CompletedProcess:
         """Run a git command."""
         cmd = ["git"] + args
