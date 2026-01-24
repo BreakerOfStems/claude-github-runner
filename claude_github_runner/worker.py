@@ -78,7 +78,13 @@ def _install_sigchld_handler():
 
 
 def _cleanup_remaining_children():
-    """Clean up any remaining child processes at exit."""
+    """Clean up any remaining child processes at exit.
+
+    Note: This is primarily for the main daemon process to clean up if it's
+    being terminated. Workers spawned via execute_async() are intentionally
+    NOT tracked in _child_pids because they should continue running
+    independently even after the tick subprocess exits.
+    """
     for pid in list(_child_pids):
         try:
             # Check if process is still alive
@@ -237,8 +243,10 @@ class Worker:
                 # Use exit code to signal success/failure to parent
                 os._exit(exit_code)
         else:
-            # Parent process - track child PID and return immediately
-            _child_pids.add(pid)
+            # Parent process - log spawn but DON'T track in _child_pids
+            # The child runs independently and should NOT be killed when this
+            # tick subprocess exits. The atexit handler would kill tracked PIDs,
+            # but we want these workers to continue running after tick() returns.
             logger.info(f"Spawned child process {pid} for run {run_id}")
             self.db.update_run_status(run_id, RunStatus.CLAIMED, pid=pid)
             return run_id
