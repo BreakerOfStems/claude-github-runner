@@ -63,7 +63,9 @@ class CircuitBreakerConfig:
 @dataclass
 class ClaudeConfig:
     command: str = "claude"
-    non_interactive_args: list[str] = field(default_factory=lambda: ["--dangerously-skip-permissions"])
+    non_interactive_args: list[str] = field(default_factory=lambda: ["--print", "--dangerously-skip-permissions"])
+    output_format: str = "stream-json"  # Output format for capturing session_id
+    enable_session_resumption: bool = True  # Resume sessions per repo for context
 
 
 @dataclass
@@ -157,6 +159,8 @@ class Config:
             config.claude = ClaudeConfig(
                 command=claude.get("command", config.claude.command),
                 non_interactive_args=claude.get("non_interactive_args", config.claude.non_interactive_args),
+                output_format=claude.get("output_format", config.claude.output_format),
+                enable_session_resumption=claude.get("enable_session_resumption", config.claude.enable_session_resumption),
             )
 
         if "priorities" in data:

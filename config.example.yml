@@ -210,6 +210,10 @@ claude:
   # Non-interactive arguments
   # Arguments passed to Claude Code for headless execution.
   #
+  # --print: Required for non-interactive output
+  #   Without this flag, Claude runs in interactive mode and doesn't
+  #   produce output to stdout/stderr. This is CRITICAL for headless operation.
+  #
   # --dangerously-skip-permissions: SECURITY SENSITIVE
   #   Bypasses all tool permission prompts. Required for unattended operation
   #   since there's no human to approve actions.
@@ -229,9 +233,31 @@ claude:
   #     - Using a dedicated GitHub user with limited repo access
   #     - Network-level isolation if processing untrusted issues
   #
-  # Default: ["--dangerously-skip-permissions"]
+  # Default: ["--print", "--dangerously-skip-permissions"]
   non_interactive_args:
+    - "--print"
     - "--dangerously-skip-permissions"
+
+  # Output format for Claude CLI
+  # Used to capture session_id from output for session resumption.
+  # The stream-json format includes session_id in the output.
+  # Default: "stream-json"
+  output_format: "stream-json"
+
+  # Enable session resumption per repository
+  # When enabled, the runner stores the session_id from each run and uses
+  # --resume on subsequent runs for the same repo. This maintains context
+  # across runs, reducing startup time and improving Claude's understanding
+  # of the codebase.
+  #
+  # Benefits:
+  #   - Faster runs (Claude doesn't need to re-explore the codebase)
+  #   - Better context (Claude remembers previous work)
+  #   - Lower token usage (cached context is reused)
+  #
+  # Sessions are automatically cleared on auth errors.
+  # Default: true
+  enable_session_resumption: true
 
 # ----------------------------------------------------------------------------
 # PRIORITY SETTINGS
