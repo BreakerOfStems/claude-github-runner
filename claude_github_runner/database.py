@@ -11,6 +11,7 @@ Key design decisions:
 - Enum values stored as lowercase strings matching Python enum values
 """
 
+import logging
 import os
 import sqlite3
 import threading
@@ -20,6 +21,8 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 class RunStatus(Enum):
@@ -114,12 +117,17 @@ class ConnectionPool:
 
     The pool also tracks the process ID to handle fork() safely - child
     processes automatically get fresh connections.
+
+    When disable_pooling is True, every get_connection() returns a fresh
+    connection that must be closed by the caller. This is used in forked
+    child processes to avoid any potential issues with inherited SQLite state.
     """
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, disable_pooling: bool = False):
         self.db_path = db_path
         self._local = threading.local()
         self._pid = os.getpid()
+        self._disable_pooling = disable_pooling
 
     def get_connection(self) -> sqlite3.Connection:
         """Get or create a connection for the current thread.
@@ -127,6 +135,8 @@ class ConnectionPool:
         Returns an existing connection if one exists for this thread,
         otherwise creates a new one. Also handles process fork by
         creating new connections in child processes.
+
+        If pooling is disabled, always returns a fresh connection.
         """
         # Check if we've forked - child processes need fresh connections
         current_pid = os.getpid()
@@ -134,6 +144,14 @@ class ConnectionPool:
             # We're in a forked child process - reset the thread local
             self._local = threading.local()
             self._pid = current_pid
+
+        # If pooling is disabled, always create a fresh connection
+        if self._disable_pooling:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            # Enable WAL mode for better concurrent access
+            conn.execute("PRAGMA journal_mode=WAL")
+            return conn
 
         if not hasattr(self._local, 'connection') or self._local.connection is None:
             conn = sqlite3.connect(self.db_path)
@@ -178,6 +196,11 @@ class Database:
     Thread safety: Each method opens its own connection, so the class
     can be used from multiple threads. However, SQLite itself may
     block concurrent writes.
+
+    Fork safety: When forked_child=True, connection pooling is disabled
+    to ensure each database operation uses a fresh connection. This
+    avoids potential issues with SQLite's internal state being inherited
+    across fork boundaries.
     """
 
     # Schema definition using CREATE IF NOT EXISTS for idempotent initialization.
@@ -230,9 +253,12 @@ class Database:
     );
     """
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, forked_child: bool = False):
         self.db_path = db_path
-        self._pool = ConnectionPool(db_path)
+        self._forked_child = forked_child
+        # Disable connection pooling in forked child processes to ensure
+        # each operation uses a fresh connection with no inherited state
+        self._pool = ConnectionPool(db_path, disable_pooling=forked_child)
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
@@ -257,6 +283,10 @@ class Database:
         Uses pooled connections - the same connection is reused for
         multiple operations within the same thread. This significantly
         reduces overhead when max_concurrency > 1.
+
+        When running in a forked child process (forked_child=True), pooling
+        is disabled and each operation uses a fresh connection that is
+        closed after use. This ensures reliable writes after fork.
         """
         conn = self._pool.get_connection()
         try:
@@ -265,8 +295,13 @@ class Database:
         except Exception:
             conn.rollback()
             raise
-        # Note: We don't close the connection here - it stays in the pool
-        # for reuse by subsequent operations in this thread
+        finally:
+            # When pooling is disabled (forked child), close connection after use
+            if self._forked_child:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def close(self):
         """Close the pooled connection for the current thread.
@@ -397,6 +432,9 @@ class Database:
         Automatically sets timestamps:
         - started_at is set when status becomes RUNNING
         - ended_at is set when status becomes SUCCEEDED, FAILED, or NEEDS_HUMAN
+
+        When running in a forked child process, logs debug information to
+        help diagnose any persistence issues.
         """
         with self._connect() as conn:
             updates = ["status = ?"]
@@ -431,10 +469,53 @@ class Database:
                 values.append(datetime.utcnow().isoformat())
 
             values.append(run_id)
-            conn.execute(
+            cursor = conn.execute(
                 f"UPDATE runs SET {', '.join(updates)} WHERE run_id = ?",
                 values,
             )
+            rows_affected = cursor.rowcount
+
+            # Log status updates in forked child processes for debugging
+            if self._forked_child:
+                logger.debug(
+                    f"Database update: run_id={run_id}, status={status.value}, "
+                    f"rows_affected={rows_affected}, pid={os.getpid()}"
+                )
+
+    def verify_run_status(self, run_id: str, expected_status: RunStatus) -> bool:
+        """Verify that a run has the expected status.
+
+        This method is useful for verifying that database writes succeeded,
+        especially in forked child processes where persistence issues have
+        been observed. Uses a fresh connection to ensure we're reading the
+        actual committed state.
+
+        Returns True if the run exists and has the expected status.
+        """
+        # Force a fresh connection for verification to ensure we're not
+        # reading from any cached state
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT status FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            conn.close()
+
+            if row and row["status"] == expected_status.value:
+                return True
+
+            if self._forked_child:
+                actual_status = row["status"] if row else "NOT_FOUND"
+                logger.warning(
+                    f"Status verification failed for {run_id}: "
+                    f"expected={expected_status.value}, actual={actual_status}"
+                )
+            return False
+        except Exception as e:
+            if self._forked_child:
+                logger.error(f"Status verification error for {run_id}: {e}")
+            return False
 
     def _row_to_run(self, row: sqlite3.Row) -> Run:
         """Convert a database row to a Run object."""
