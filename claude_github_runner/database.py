@@ -251,6 +251,15 @@ class Database:
         repo TEXT PRIMARY KEY,
         last_poll_at TEXT
     );
+
+    -- Session tracking: stores Claude session IDs per repository.
+    -- Used for session resumption to maintain context across runs,
+    -- reducing startup time and improving run quality.
+    CREATE TABLE IF NOT EXISTS sessions (
+        repo TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
     """
 
     def __init__(self, db_path: str, forked_child: bool = False):
@@ -595,6 +604,44 @@ class Database:
                 """,
                 (repo, last_poll_at.isoformat(), last_poll_at.isoformat()),
             )
+
+    # Session operations
+
+    def get_session(self, repo: str) -> Optional[str]:
+        """Get the stored session ID for a repo.
+
+        Returns None if no session exists for this repo.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT session_id FROM sessions WHERE repo = ?", (repo,)
+            ).fetchone()
+            if row and row["session_id"]:
+                return row["session_id"]
+        return None
+
+    def update_session(self, repo: str, session_id: str):
+        """Update the session ID for a repo.
+
+        Uses SQLite's ON CONFLICT clause for atomic upsert behavior.
+        """
+        with self._connect() as conn:
+            now = datetime.utcnow().isoformat()
+            conn.execute(
+                """
+                INSERT INTO sessions (repo, session_id, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(repo) DO UPDATE SET session_id = ?, updated_at = ?
+                """,
+                (repo, session_id, now, session_id, now),
+            )
+
+    def clear_session(self, repo: str):
+        """Clear the session ID for a repo.
+
+        Call this if a session becomes invalid (e.g., auth error, corruption).
+        """
+        with self._connect() as conn:
+            conn.execute("DELETE FROM sessions WHERE repo = ?", (repo,))
 
     # Maintenance operations
 

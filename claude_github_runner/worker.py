@@ -288,7 +288,7 @@ class Worker:
 
         # Invoke Claude Code
         logger.info("Invoking Claude Code")
-        self._invoke_claude(paths, run_id)
+        self._invoke_claude(paths, run_id, job.repo)
 
         # Handle Claude's output and finalize
         self._handle_claude_output(git, job, run_id, paths, branch_name, base_branch)
@@ -599,35 +599,62 @@ class Worker:
 
         return "\n".join(lines)
 
-    def _invoke_claude(self, paths: WorkspacePaths, run_id: str, retry_count: int = 0):
+    def _invoke_claude(self, paths: WorkspacePaths, run_id: str, repo: str, retry_count: int = 0):
         """Invoke Claude Code non-interactively."""
-        cmd = self._build_claude_command(paths)
+        cmd = self._build_claude_command(paths, repo)
         stdout_path, stderr_path = self._get_claude_log_paths(paths)
 
         logger.info(f"Running Claude in: {paths.repo}")
         logger.info(f"Log file: {paths.claude_log}")
+        logger.info(f"Command: {' '.join(cmd[:5])}...")  # Log first 5 args for debugging
 
         returncode = self._run_claude_process(cmd, paths, stdout_path, stderr_path)
 
         # Check for auth errors and retry if needed
         if self._has_auth_error(stdout_path):
+            # Clear session on auth error - it may be stale
+            if self.config.claude.enable_session_resumption:
+                logger.info(f"Clearing session for {repo} due to auth error")
+                self.db.clear_session(repo)
             if retry_count < self.config.retry.max_retries:
-                return self._retry_with_backoff(paths, run_id, retry_count)
+                return self._retry_with_backoff(paths, run_id, repo, retry_count)
             else:
                 logger.error("Auth error persists after retry - token may need manual refresh")
+
+        # Extract and store session_id for future runs
+        if self.config.claude.enable_session_resumption:
+            self._extract_and_store_session(stdout_path, repo)
 
         self._combine_log_files(paths, stdout_path, stderr_path)
         self._log_claude_errors(returncode, stderr_path, run_id)
 
-    def _build_claude_command(self, paths: WorkspacePaths) -> list[str]:
-        """Build the command for headless Claude execution."""
+    def _build_claude_command(self, paths: WorkspacePaths, repo: str) -> list[str]:
+        """Build the command for headless Claude execution.
+
+        Includes session resumption if enabled and a previous session exists.
+        Uses stream-json output format to capture session_id for future runs.
+        """
         prompt = paths.prompt_file.read_text()
-        return [
+        cmd = [
             self.config.claude.command,
             *self.config.claude.non_interactive_args,
-            "-p",
-            prompt,
         ]
+
+        # Add output format for session_id capture
+        if self.config.claude.output_format:
+            cmd.extend(["--output-format", self.config.claude.output_format])
+
+        # Add session resumption if enabled
+        if self.config.claude.enable_session_resumption:
+            session_id = self.db.get_session(repo)
+            if session_id:
+                logger.info(f"Resuming session {session_id[:8]}... for {repo}")
+                cmd.extend(["--resume", session_id])
+
+        # Add the prompt
+        cmd.extend(["-p", prompt])
+
+        return cmd
 
     def _get_claude_log_paths(self, paths: WorkspacePaths) -> tuple[Path, Path]:
         """Get paths for Claude stdout and stderr log files."""
@@ -814,7 +841,7 @@ class Worker:
             "authentication_error" in stdout_content or "OAuth token has expired" in stdout_content
         )
 
-    def _retry_with_backoff(self, paths: WorkspacePaths, run_id: str, retry_count: int):
+    def _retry_with_backoff(self, paths: WorkspacePaths, run_id: str, repo: str, retry_count: int):
         """Retry Claude invocation with exponential backoff."""
         import time
 
@@ -826,7 +853,44 @@ class Worker:
             f"after {delay:.1f}s delay..."
         )
         time.sleep(delay)
-        return self._invoke_claude(paths, run_id, retry_count + 1)
+        return self._invoke_claude(paths, run_id, repo, retry_count + 1)
+
+    def _extract_and_store_session(self, stdout_path: Path, repo: str):
+        """Extract session_id from Claude's JSON output and store it.
+
+        The stream-json output format includes session_id in the final result.
+        We parse the output looking for the session_id field and store it
+        for use in future runs on this repo.
+        """
+        try:
+            content = stdout_path.read_text()
+            if not content.strip():
+                logger.debug("No output to extract session_id from")
+                return
+
+            # Look for session_id in JSON output
+            # stream-json outputs multiple JSON objects, look for session_id in any of them
+            session_id = None
+            for line in content.split('\n'):
+                line = line.strip()
+                if not line or not line.startswith('{'):
+                    continue
+                try:
+                    data = json.loads(line)
+                    if 'session_id' in data:
+                        session_id = data['session_id']
+                        break
+                except json.JSONDecodeError:
+                    continue
+
+            if session_id:
+                logger.info(f"Extracted session_id {session_id[:8]}... for {repo}")
+                self.db.update_session(repo, session_id)
+            else:
+                logger.debug(f"No session_id found in output for {repo}")
+
+        except Exception as e:
+            logger.warning(f"Failed to extract session_id: {e}")
 
     def _combine_log_files(self, paths: WorkspacePaths, stdout_path: Path, stderr_path: Path):
         """Combine stdout and stderr into a single log file."""
