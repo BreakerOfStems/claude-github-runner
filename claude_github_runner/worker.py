@@ -218,13 +218,15 @@ class Worker:
                 logger.info(f"Child process {os.getpid()} started for run {run_id}")
 
                 # Reconnect to database (connection isn't safe to share across fork)
-                self.db = Database(self.config.paths.db_path)
+                # Use forked_child=True to disable connection pooling and ensure
+                # each database operation uses a fresh connection with no inherited state
+                self.db = Database(self.config.paths.db_path, forked_child=True)
                 self.github = GitHub(
                     circuit_breaker_config=self.config.circuit_breaker,
                     timeout_seconds=self.config.timeouts.github_api_timeout_seconds,
                 )
 
-                logger.info("Database and GitHub reconnected")
+                logger.info("Database and GitHub reconnected in forked child process")
 
                 self._execute_job(run_id, job, paths)
             except Exception as e:
@@ -253,8 +255,13 @@ class Worker:
 
     def _execute_job(self, run_id: str, job: Job, paths: WorkspacePaths):
         """Execute the job steps."""
-        # Update status to claimed
+        # Update status to claimed with PID
         self.db.update_run_status(run_id, RunStatus.CLAIMED, pid=os.getpid())
+        logger.info(f"Updated run {run_id} status to CLAIMED with pid={os.getpid()}")
+
+        # Verify the write succeeded (helps diagnose fork persistence issues)
+        if not self.db.verify_run_status(run_id, RunStatus.CLAIMED):
+            logger.error(f"Database write verification failed for run {run_id} - status not CLAIMED")
 
         # Claim on GitHub and post starting comment
         self._claim_on_github(job, run_id)
@@ -265,6 +272,11 @@ class Worker:
         # Create working branch
         branch_name = self._get_branch_name(job)
         self.db.update_run_status(run_id, RunStatus.RUNNING, branch=branch_name)
+        logger.info(f"Updated run {run_id} status to RUNNING with branch={branch_name}")
+
+        # Verify the write succeeded
+        if not self.db.verify_run_status(run_id, RunStatus.RUNNING):
+            logger.error(f"Database write verification failed for run {run_id} - status not RUNNING")
 
         # Checkout or create the working branch
         if not self._setup_working_branch(git, branch_name, base_branch, job, run_id, paths):
@@ -445,6 +457,12 @@ class Worker:
     def _finalize_success(self, job: Job, run_id: str, paths: WorkspacePaths, pr_url: str):
         """Finalize a successful run - update status, labels, summary, and cleanup."""
         self.db.update_run_status(run_id, RunStatus.SUCCEEDED, pr_url=pr_url)
+        logger.info(f"Updated run {run_id} status to SUCCEEDED with pr_url={pr_url}")
+
+        # Verify the write succeeded (helps diagnose fork persistence issues)
+        if not self.db.verify_run_status(run_id, RunStatus.SUCCEEDED):
+            logger.error(f"Database write verification failed for run {run_id} - status not SUCCEEDED")
+
         self._handle_success(job, run_id, paths, pr_url)
         self._write_summary(paths, run_id, job, "succeeded", pr_url=pr_url)
         self.workspace_manager.cleanup(run_id, success=True)
