@@ -610,6 +610,16 @@ class Worker:
 
         returncode = self._run_claude_process(cmd, paths, stdout_path, stderr_path)
 
+        # Check for session not found error (invalid --resume session_id)
+        if self._has_session_error(stdout_path):
+            if self.config.claude.enable_session_resumption:
+                logger.warning(f"Session not found for {repo}, clearing and retrying without --resume")
+                self.db.clear_session(repo)
+            if retry_count < self.config.retry.max_retries:
+                return self._retry_with_backoff(paths, run_id, repo, retry_count)
+            else:
+                logger.error("Session error persists after retry")
+
         # Check for auth errors and retry if needed
         if self._has_auth_error(stdout_path):
             # Clear session on auth error - it may be stale
@@ -844,6 +854,15 @@ class Worker:
             "authentication_error" in stdout_content or "OAuth token has expired" in stdout_content
         )
 
+    def _has_session_error(self, stdout_path: Path) -> bool:
+        """Check if the output contains a session not found error.
+
+        This happens when --resume is used with an invalid/expired session_id.
+        The error appears in the JSON output as: "No conversation found with session ID: ..."
+        """
+        stdout_content = stdout_path.read_text()
+        return "No conversation found with session ID" in stdout_content
+
     def _retry_with_backoff(self, paths: WorkspacePaths, run_id: str, repo: str, retry_count: int):
         """Retry Claude invocation with exponential backoff."""
         import time
@@ -852,7 +871,7 @@ class Worker:
             self.config.retry.backoff_multiplier**retry_count
         )
         logger.warning(
-            f"Auth error detected, retrying (attempt {retry_count + 2}/{self.config.retry.max_retries + 1}) "
+            f"Retrying Claude (attempt {retry_count + 2}/{self.config.retry.max_retries + 1}) "
             f"after {delay:.1f}s delay..."
         )
         time.sleep(delay)
