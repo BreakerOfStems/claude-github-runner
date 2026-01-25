@@ -641,7 +641,10 @@ class Worker:
         ]
 
         # Add output format for session_id capture
+        # Note: stream-json requires --verbose when used with --print
         if self.config.claude.output_format:
+            if self.config.claude.output_format == "stream-json":
+                cmd.append("--verbose")
             cmd.extend(["--output-format", self.config.claude.output_format])
 
         # Add session resumption if enabled
