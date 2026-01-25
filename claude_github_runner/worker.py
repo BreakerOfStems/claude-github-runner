@@ -232,12 +232,22 @@ class Worker:
             except Exception as e:
                 logger.exception(f"Run {run_id} failed: {e}")
                 exit_code = 1
+                # Handle failure with resilience - each step can fail independently
+                # Post GitHub comment first (most important for user visibility)
+                try:
+                    self._handle_failure(job, run_id, paths, str(e))
+                except Exception as gh_error:
+                    logger.error(f"Failed to post failure comment: {gh_error}")
+                # Update database
                 try:
                     self.db.update_run_status(run_id, RunStatus.FAILED, error=str(e))
-                    self._handle_failure(job, run_id, paths, str(e))
+                except Exception as db_error:
+                    logger.error(f"Failed to update database status: {db_error}")
+                # Cleanup workspace
+                try:
                     self.workspace_manager.cleanup(run_id, success=False)
                 except Exception as cleanup_error:
-                    logger.exception(f"Failed to clean up after error: {cleanup_error}")
+                    logger.error(f"Failed to cleanup workspace: {cleanup_error}")
             finally:
                 # Flush logs before exit
                 logging.shutdown()
@@ -455,17 +465,41 @@ class Worker:
         self._finalize_success(job, run_id, paths, pr_url)
 
     def _finalize_success(self, job: Job, run_id: str, paths: WorkspacePaths, pr_url: str):
-        """Finalize a successful run - update status, labels, summary, and cleanup."""
-        self.db.update_run_status(run_id, RunStatus.SUCCEEDED, pr_url=pr_url)
-        logger.info(f"Updated run {run_id} status to SUCCEEDED with pr_url={pr_url}")
+        """Finalize a successful run - update status, labels, summary, and cleanup.
 
-        # Verify the write succeeded (helps diagnose fork persistence issues)
-        if not self.db.verify_run_status(run_id, RunStatus.SUCCEEDED):
-            logger.error(f"Database write verification failed for run {run_id} - status not SUCCEEDED")
+        This method is resilient to individual failures - it will attempt all
+        finalization steps even if some fail, to ensure the GitHub comment is
+        posted and the user is notified of the PR.
+        """
+        # Post GitHub comment first - this is the most important user-facing action
+        # Do this before database updates so users see the PR even if DB fails
+        try:
+            self._handle_success(job, run_id, paths, pr_url)
+        except Exception as e:
+            logger.error(f"Failed to post success comment for {run_id}: {e}")
 
-        self._handle_success(job, run_id, paths, pr_url)
-        self._write_summary(paths, run_id, job, "succeeded", pr_url=pr_url)
-        self.workspace_manager.cleanup(run_id, success=True)
+        # Update database status - failure here shouldn't block other operations
+        try:
+            self.db.update_run_status(run_id, RunStatus.SUCCEEDED, pr_url=pr_url)
+            logger.info(f"Updated run {run_id} status to SUCCEEDED with pr_url={pr_url}")
+
+            # Verify the write succeeded (helps diagnose fork persistence issues)
+            if not self.db.verify_run_status(run_id, RunStatus.SUCCEEDED):
+                logger.error(f"Database write verification failed for run {run_id} - status not SUCCEEDED")
+        except Exception as e:
+            logger.error(f"Failed to update database status for {run_id}: {e}")
+
+        # Write summary file
+        try:
+            self._write_summary(paths, run_id, job, "succeeded", pr_url=pr_url)
+        except Exception as e:
+            logger.error(f"Failed to write summary for {run_id}: {e}")
+
+        # Cleanup workspace
+        try:
+            self.workspace_manager.cleanup(run_id, success=True)
+        except Exception as e:
+            logger.error(f"Failed to cleanup workspace for {run_id}: {e}")
 
     def _claim_on_github(self, job: Job, run_id: str) -> bool:
         """Claim the issue/PR on GitHub and post starting comment.
